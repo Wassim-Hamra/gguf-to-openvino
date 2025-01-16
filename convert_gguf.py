@@ -87,7 +87,7 @@ def rotate_half(x, head_dim):
     gather = opset.gather(shape_of, indices=np.int64([0, 1, 2]), axis=np.int64(0))
     x1 = opset.slice(x, [0, 0, 0, 0], opset.concat([gather, np.int64([split_dim])], axis=0), [1, 1, 1, 1], axes=[0, 1, 2, 3])
     x2 = opset.slice(x, [0, 0, 0, split_dim], opset.concat([gather, np.int64([head_dim])], axis=0), [1, 1, 1, 1], axes=[0, 1, 2, 3])
-    neg_x2 = opset.multiply(x2, opset.constant(-1.0, Type.f16))
+    neg_x2 = opset.multiply(x2, opset.constant(-1.0, Type.f32))
     rotated = opset.concat([neg_x2, x1], axis=-1)
     return rotated
 
@@ -105,8 +105,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, head_dim, unsqueeze_dim=1):
         Tuple of (q_rotated, k_rotated) tensors.
     """
     # Unsqueeze cos and sin along the specified dimension
-    cos_unsqueezed = opset.convert(opset.unsqueeze(cos, np.int64(unsqueeze_dim)), Type.f16)
-    sin_unsqueezed = opset.convert(opset.unsqueeze(sin, np.int64(unsqueeze_dim)), Type.f16)
+    cos_unsqueezed = opset.unsqueeze(cos, np.int64(unsqueeze_dim))
+    sin_unsqueezed = opset.unsqueeze(sin, np.int64(unsqueeze_dim))
 
     # Apply Rotary Positional Embedding
     q_rotated = opset.add(opset.multiply(q, cos_unsqueezed), opset.multiply(rotate_half(q, head_dim), sin_unsqueezed))
@@ -130,8 +130,6 @@ def rope_emb(x, rope_const, position_ids, seq_len=None):
         sin: Sine component of the rotary embedding.
     """
     # Expand dimensions for broadcasting
-    print(rope_const.get_output_shape(0))
-    print(position_ids.get_output_partial_shape(0))
     inv_freq_expanded = opset.unsqueeze(rope_const, 0)  # Add batch dimension: [1, head_dim]
     inv_freq_expanded = opset.unsqueeze(inv_freq_expanded, -1)  # Shape: [1, head_dim, 1]
 
@@ -211,7 +209,7 @@ def multi_head_attention(query, key, value,
     # 3. Calculate attention scores
     # Scale Q by sqrt(head_dim)
     scale = np.float32(1.0 / np.sqrt(head_dim))
-    q_scaled = opset.multiply(q, opset.constant(scale, Type.f16))
+    q_scaled = opset.multiply(q, opset.constant(scale, Type.f32))
     
     # Compute attention scores
     # [batch, num_heads, seq_len, seq_len]
@@ -226,7 +224,7 @@ def multi_head_attention(query, key, value,
     
     # 6. Apply attention to values
     # [batch, num_heads, seq_len, head_dim]
-    context = opset.matmul(opset.convert(attention_weights, Type.f16), v, transpose_a=False, transpose_b=False)
+    context = opset.matmul(attention_weights, v, transpose_a=False, transpose_b=False)
     
     # 7. Reshape output
     # Transpose back to [batch, seq_len, num_heads, head_dim]
@@ -246,8 +244,9 @@ def make_fc(key, input, consts, name_suffix=""):
 
     weights = Constant(weight, True)
     weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
+    w_f32 = opset.convert(weights, Type.f32)
 
-    matmul = opset.matmul(input, weights, transpose_a=False, transpose_b=True, name=f"{key}.matmul{name_suffix}")
+    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True, name=f"{key}.matmul{name_suffix}")
 
     # add bias
     if consts[f"{key}.bias"] is not None:
@@ -268,23 +267,23 @@ def make_mvn(key, input, consts, configs, name_suffix=""):
     return mvn
 
 def make_rms_norm(key, input, consts, epsilon, name_suffix=""):
-    weights = opset.constant(consts[f"{key}.weight"], Type.f16, name=f"{key}.weight{name_suffix}")
-    pow = opset.multiply(input, input, name=f"{key}.pow{name_suffix}")
-    #pow = opset.power(input, np.array([2], np.float32), name=f"{key}.pow{name_suffix}")
+    weights = opset.constant(consts[f"{key}.weight"].astype(np.float32), Type.f32)
+    epsilon_c = opset.constant(epsilon, Type.f32)
+    #pow = opset.multiply(input, input, name=f"{key}.pow{name_suffix}")
+    pow = opset.power(input, np.array([2], np.float32), name=f"{key}.pow{name_suffix}")
     variance = opset.reduce_mean(pow, reduction_axes=[-1], keep_dims=True, name=f"{key}.var{name_suffix}")
-    add = opset.add(variance, opset.constant(epsilon, variance.get_element_type()), name=f"{key}.add{name_suffix}")
+    add = opset.add(variance, epsilon_c, name=f"{key}.add{name_suffix}")
     sqrt = opset.sqrt(add, name=f"{key}.sqrt{name_suffix}")
-    div = opset.divide(input, sqrt, name=f"{key}.div{name_suffix}")
-    mul = opset.multiply(div, opset.convert(weights, div.get_element_type()), auto_broadcast="numpy", name=f"{key}.mul{name_suffix}")
+    div = opset.divide(weights, sqrt, name=f"{key}.div{name_suffix}")
+    mul = opset.multiply(div, input, auto_broadcast="numpy", name=f"{key}.mul{name_suffix}")
     return opset.convert(mul, input.get_element_type())
 
 def make_embedding(key, input, consts):
-    if configs["quant_type"] != "":
-        embed_in_const = _make_compressed_weight_nncf(consts[key], key)
-    else:
-        embed_in_const = Constant(consts[key], True)
-        embed_in_const.set_friendly_name(name=key)
-    inputs_embeds = opset.gather(embed_in_const, indices=input, axis=0)
+    embed_in_const = Constant(consts[key], True)
+    embed_f32 = opset.convert(embed_in_const, Type.f32)
+    embed_f32.set_friendly_name(name=key)
+    input_int32 = opset.convert(input, Type.i32)
+    inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
     return inputs_embeds
 
 def save_tokenzier(orig_model_path, ov_model_path):
@@ -332,7 +331,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
     # mlp
     def mlp(states):
         gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx], name_suffix)
-        silu = opset.swish(gate_proj, beta=opset.constant(1.0, Type.f16))
+        silu = opset.swish(gate_proj)
         up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx], name_suffix)
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
         down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx], name_suffix)
