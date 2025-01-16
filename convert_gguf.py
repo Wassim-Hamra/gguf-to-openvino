@@ -272,11 +272,11 @@ def make_rms_norm(key, input, consts, epsilon, name_suffix=""):
     pow = opset.multiply(input, input, name=f"{key}.pow{name_suffix}")
     #pow = opset.power(input, np.array([2], np.float32), name=f"{key}.pow{name_suffix}")
     variance = opset.reduce_mean(pow, reduction_axes=[-1], keep_dims=True, name=f"{key}.var{name_suffix}")
-    add = opset.add(variance, opset.constant(epsilon, Type.f16), name=f"{key}.add{name_suffix}")
+    add = opset.add(variance, opset.constant(epsilon, variance.get_element_type()), name=f"{key}.add{name_suffix}")
     sqrt = opset.sqrt(add, name=f"{key}.sqrt{name_suffix}")
     div = opset.divide(input, sqrt, name=f"{key}.div{name_suffix}")
-    mul = opset.multiply(div, weights, auto_broadcast="numpy", name=f"{key}.mul{name_suffix}")
-    return mul
+    mul = opset.multiply(div, opset.convert(weights, div.get_element_type()), auto_broadcast="numpy", name=f"{key}.mul{name_suffix}")
+    return opset.convert(mul, input.get_element_type())
 
 def make_embedding(key, input, consts):
     if configs["quant_type"] != "":
@@ -393,12 +393,14 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     # Load GGUF model
     weights, metadata = mx.load(model_path, return_metadata=True)
 
+    print(metadata.keys())
+
     config = {
         "layer_num": metadata["llama.block_count"].item(),
         "head_num": metadata["llama.attention.head_count"].item(),
         "head_size": metadata["llama.embedding_length"].item() // metadata["llama.attention.head_count"].item(),
         "hidden_size": metadata["llama.embedding_length"].item(),
-        "max_position_embeddings": metadata["llama.context_length"].item(),
+        "max_position_embeddings": metadata.get("llama.context_length", np.int32([2048])).item(),
         "rotary_dims": metadata["llama.rope.dimension_count"].item(),
         "rms_norm_eps": metadata["llama.attention.layer_norm_rms_epsilon"].item(),
     }
