@@ -1,5 +1,5 @@
 from openvino.runtime import Core, Model, Tensor, PartialShape, Type, serialize, opset_utils
-from openvino.runtime import opset10 as opset
+from openvino.runtime import opset15 as opset
 import numpy as np
 import sys, os
 import argparse
@@ -8,9 +8,7 @@ from tqdm import tqdm
 from typing import Dict, Any
 from pathlib import Path
 
-from transformers import AutoTokenizer
-from openvino.runtime import Core, Model, Tensor, PartialShape, Type, serialize, opset_utils
-from openvino.runtime import opset10 as opset
+from transformers import AutoTokenizer, AutoConfig
 from openvino.runtime.op import Constant
 import numpy as np
 import os
@@ -82,54 +80,6 @@ def create_attention_mask(input_shape, opset):
     mask = -10000.0 * mask
     return opset.constant(mask, Type.f32)
 
-# def apply_rotary_embedding(q, k, sin, cos, hidden_dim, opset):
-#     """Apply rotary position embeddings to Q and K"""
-#     # Reshape q and k to separate heads and rotary dimensions
-#     # q_rot, q_pass = opset.split(q, axis=-1, num_splits=2)
-#     # k_rot, k_pass = opset.split(k, axis=-1, num_split=2)
-#     print("hidden_dim: ", hidden_dim)
-#     q_rot = opset.slice(q,
-#                         opset.constant([0], dtype=np.int64),
-#                         opset.constant([hidden_dim // 2], dtype=np.int64),
-#                         opset.constant([1], dtype=np.int64),
-#                         axes=np.int64([3]))
-#     q_pass = opset.slice(q,
-#                         opset.constant([hidden_dim // 2], dtype=np.int64),
-#                         opset.constant([hidden_dim], dtype=np.int64),
-#                         opset.constant([1], dtype=np.int64),
-#                         axes=np.int64([3]))
-    
-#     k_rot = opset.slice(k,
-#                         opset.constant([0], dtype=np.int64),
-#                         opset.constant([hidden_dim // 2], dtype=np.int64),
-#                         opset.constant([1], dtype=np.int64),
-#                         axes=np.int64([3]))
-#     k_pass = opset.slice(k,
-#                         opset.constant([hidden_dim // 2], dtype=np.int64),
-#                         opset.constant([hidden_dim], dtype=np.int64),
-#                         opset.constant([1], dtype=np.int64),
-#                         axes=np.int64([3]))
-    
-#     # Reshape for rotation
-#     q_rot_reshape = opset.reshape(q_rot, [-1, hidden_dim // 2, 2], False)
-#     k_rot_reshape = opset.reshape(k_rot, [-1, hidden_dim // 2, 2], False)
-    
-#     # Apply rotation using sin and cos
-#     q_rot_cos = opset.multiply(q_rot_reshape, opset.convert(cos, Type.f16))
-#     q_rot_sin = opset.multiply(q_rot_reshape, opset.convert(sin, Type.f16))
-#     k_rot_cos = opset.multiply(k_rot_reshape, opset.convert(cos, Type.f16))
-#     k_rot_sin = opset.multiply(k_rot_reshape, opset.convert(sin, Type.f16))
-    
-#     # Reshape back and concatenate with pass-through part
-#     q_rot_final = opset.reshape(q_rot_cos - q_rot_sin, opset.shape_of(q_rot), False)
-#     k_rot_final = opset.reshape(k_rot_cos - k_rot_sin, opset.shape_of(k_rot), False)
-    
-#     # Concatenate rotated and pass-through parts
-#     q_out = opset.concat([q_rot_final, q_pass], axis=-1)
-#     k_out = opset.concat([k_rot_final, k_pass], axis=-1)
-    
-#     return q_out, k_out
-
 def rotate_half(x, head_dim):
     """Rotates half the hidden dimensions of the input tensor."""
     split_dim = head_dim // 2 #x.get_shape()[-1] // 2
@@ -164,12 +114,53 @@ def apply_rotary_pos_emb(q, k, cos, sin, head_dim, unsqueeze_dim=1):
 
     return q_rotated, k_rotated
 
+
+def rope_emb(x, rope_const, position_ids, seq_len=None):
+    """
+    Generates Rotary Position Embedding (RoPE) cosine and sine components using OpenVINO.
+
+    Args:
+        x: The input tensor to determine the device and dtype (OpenVINO node).
+        rope_const: Tensor containing the rotary embedding constants (OpenVINO node).
+        position_ids: Tensor with position IDs (OpenVINO node).
+        seq_len: Optional sequence length (not used in computation here).
+
+    Returns:
+        cos: Cosine component of the rotary embedding.
+        sin: Sine component of the rotary embedding.
+    """
+    # Expand dimensions for broadcasting
+    print(rope_const.get_output_shape(0))
+    print(position_ids.get_output_partial_shape(0))
+    inv_freq_expanded = opset.unsqueeze(rope_const, 0)  # Add batch dimension: [1, head_dim]
+    inv_freq_expanded = opset.unsqueeze(inv_freq_expanded, -1)  # Shape: [1, head_dim, 1]
+
+    position_ids_expanded = opset.convert(opset.unsqueeze(position_ids, 1), Type.f32)  # Add head_dim axis: [batch_size, 1, seq_len]
+
+    # Compute frequencies
+    freqs = opset.matmul(inv_freq_expanded, position_ids_expanded, transpose_a=False, transpose_b=False)  # Shape: [batch_size, seq_len, head_dim]
+    freqs_transposed = opset.transpose(freqs, [0, 2, 1])  # Transpose to shape: [batch_size, head_dim, seq_len]
+
+    # Concatenate frequencies along the last dimension
+    emb = opset.concat([freqs_transposed, freqs_transposed], axis=-1)  # Shape: [batch_size, head_dim, seq_len * 2]
+
+    # Compute cosine and sine
+    cos = opset.cos(emb)
+    sin = opset.sin(emb)
+
+    # Ensure output matches input dtype
+    cos_casted = opset.convert(cos, x.get_element_type())
+    sin_casted = opset.convert(sin, x.get_element_type())
+
+    return cos_casted, sin_casted
+
+
 def multi_head_attention(query, key, value, 
                         num_heads, 
                         head_dim,
                         mask=None,
-                        sin=None,
-                        cos=None,
+                        position_ids=None,
+                        rope_const=None,
                         opset=opset):
     """
     Implements multi-head self-attention using OpenVINO operations
@@ -209,6 +200,8 @@ def multi_head_attention(query, key, value,
     q = split_heads(query, "query")
     k = split_heads(key, "key")
     v = split_heads(value, "value")
+
+    sin, cos = rope_emb(v, rope_const, position_ids)
     
     # 2. Apply rotary embeddings if provided
     if sin is not None and cos is not None:
@@ -226,14 +219,14 @@ def multi_head_attention(query, key, value,
     
     # 4. Apply attention mask if provided
     if mask is not None:
-        scores = opset.add(scores, mask, name="masked_scores")
+        scores = opset.add(opset.convert(scores, Type.f32), opset.convert(mask, Type.f32), name="masked_scores")
     
     # 5. Apply softmax
     attention_weights = opset.softmax(scores, axis=-1, name="attention_weights")
     
     # 6. Apply attention to values
     # [batch, num_heads, seq_len, head_dim]
-    context = opset.matmul(attention_weights, v, transpose_a=False, transpose_b=False)
+    context = opset.matmul(opset.convert(attention_weights, Type.f16), v, transpose_a=False, transpose_b=False)
     
     # 7. Reshape output
     # Transpose back to [batch, seq_len, num_heads, head_dim]
@@ -247,70 +240,14 @@ def multi_head_attention(query, key, value,
     return output
 #=========================================================================
 
-
-def make_experimental_fc(input, weight, name):
-    quant_type = configs['quant_type']
-
-    def quantize_weights(weight, quant_type):
-        try:
-            # build a FC node in `evaluate_qweight` mode to quantize & relayout weight
-            qweight_node = custom_opset.create('FC', [Constant(weight, True)], {
-                'quant_type':quant_type,
-                'N' : weight.shape[0],
-                'K' : weight.shape[1],
-                'evaluate_qweight' : 1
-            })
-        except RuntimeError:
-            # unsupported quant type
-            return []
-
-        # unsupported quant type
-        if qweight_node.get_output_size() == 0:
-            return []
-
-        # create tensors with required shape & dtype to hold quantized weights
-        output_vec = []
-        for i in range(qweight_node.get_output_size()):
-            ov_type = qweight_node.get_output_element_type(i)
-            ov_shape = qweight_node.get_output_shape(i)
-            output_vec.append(Tensor(ov_type, ov_shape))
-
-        # evaluate_qweight
-        if not qweight_node.evaluate(output_vec, [Tensor(weight)]):
-            raise Exception("weight quantization failed!")
-
-        return [Constant(w) for w in output_vec]
-
-    quantized_weights_list = quantize_weights(weight, quant_type)
-
-    if len(quantized_weights_list) == 0:
-        return None
-
-    return custom_opset.create('FC', [input, *quantized_weights_list] , {
-        'quant_type':quant_type,
-        'N' : weight.shape[0],
-        'K' : weight.shape[1],
-        'evaluate_qweight' : 0
-    })
-
-
 def make_fc(key, input, consts, name_suffix=""):
     # weight const f32 NxK
     weight = consts[f"{key}.weight"]
 
-    # try experimental fc first
-    matmul = make_experimental_fc(input, weight, key)
+    weights = Constant(weight, True)
+    weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
 
-    # fallbacks
-    if not matmul:
-        if configs["quant_type"] == "nncf_w8":
-            weights = _make_compressed_weight_nncf(weight, key)
-        elif configs["quant_type"] == "":
-            weights = Constant(weight, True)
-            weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
-        else:
-            raise Exception(f"Unknown quant type: {configs['quant_type']}")
-        matmul = opset.matmul(input, weights, transpose_a=False, transpose_b=True, name=f"{key}.matmul{name_suffix}")
+    matmul = opset.matmul(input, weights, transpose_a=False, transpose_b=True, name=f"{key}.matmul{name_suffix}")
 
     # add bias
     if consts[f"{key}.bias"] is not None:
@@ -364,7 +301,7 @@ def save_tokenzier(orig_model_path, ov_model_path):
 
 
 
-def layer(configs, consts, layer_idx, hidden_states, kv_cache, beam_table, attn_mask, cos_tab, sin_tab):
+def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, rope_const):
     name_suffix = f".layer{layer_idx}"
     name_prefix = "model.layers.self_attn"
     # layerNorm operation
@@ -382,8 +319,8 @@ def layer(configs, consts, layer_idx, hidden_states, kv_cache, beam_table, attn_
                         configs["head_num"],
                         configs["head_size"],
                         mask=attn_mask,
-                        sin=sin_tab,
-                        cos=cos_tab,
+                        position_ids=position_ids,
+                        rope_const=rope_const,
                         opset=opset)
 
 
@@ -406,90 +343,46 @@ def layer(configs, consts, layer_idx, hidden_states, kv_cache, beam_table, attn_
     output = opset.add(attn_output, mlp_output, auto_broadcast="numpy", name=f"{name_prefix}.add1{name_suffix}")
     return output
 
+
+def init_rope(head_dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float().to(device) / head_dim))
+    # For BC we register cos and sin cached
+    rope_const = opset.constant(inv_freq.numpy(), Type.f32)
+    return rope_const
+
+
 def create_model(configs, consts):
     print(f"start generate ov model...")
     beg = time.time()
     # [batch, query_len]
-    input_ids = opset.parameter([-1, -1], Type.i32, name="input_ids")
-    # [2 * n_layers, batch, n_head, max_kv_len, head_size]
-    kv_cache = opset.parameter([2 * configs["layer_num"], -1, configs["head_num"], -1, configs["head_size"]], Type.f16, name="kv_cache")
-    # [batch, max_kv_len]
-    beam_table = opset.parameter([-1, -1], Type.i32, name="beam_table")
+    input_ids = opset.parameter([-1, -1], Type.i64, name="input_ids")
     # [batch, query_len+past_len]
-    attn_mask = opset.parameter([-1, -1], Type.f16, name="attn_mask")
-    # [max_kv_len, rotary_dims//2]
-    cos_tab = opset.parameter([-1, configs["rotary_dims"]], Type.f32, name="cos_tab")
-    sin_tab = opset.parameter([-1, configs["rotary_dims"]], Type.f32, name="sin_tab")
+    attention_mask = opset.parameter([-1, -1], Type.i64, name="attention_mask")
+    # [batch, query_len+past_len]
+    position_ids = opset.parameter([-1, -1], Type.i64, name="position_ids")
+    # [batch, max_kv_len]
+    beam_idx = opset.parameter([-1], Type.i32, name="beam_idx")
 
     inputs_embeds = make_embedding("model.embed_tokens.weight", input_ids, consts)
     hidden_states = inputs_embeds
 
+    rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"])
+
     for i in tqdm(range(configs["layer_num"])):
-        hidden_states = layer(configs, consts, i, hidden_states, kv_cache, beam_table, attn_mask, cos_tab, sin_tab)
+        hidden_states = layer(configs, consts, i, hidden_states, attention_mask, position_ids, rope_const)
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
     # embed_out
     embed_out = make_fc("lm_head", final_layernorm, consts)
-    embed_out_result = opset.result(embed_out, name="logits")
+
+    logits = opset.result(opset.convert(embed_out, Type.f32), name="logits")
+    logits.set_friendly_name("logits")
     cost = time.time() - beg
     print(f"generate ov model done, cost {cost:.2f} seconds.")
-    return Model([embed_out_result],
-                 [input_ids, kv_cache, beam_table, attn_mask, cos_tab, sin_tab])
-
-def load_hf_model(path):
-    print(f"extracting from model '{path}'...")
-    beg = time.time()
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True).to("cpu").eval()
-
-    assert(model.config.num_key_value_heads == model.config.num_attention_heads)
-    assert(model.config.hidden_act in ["silu"])
-    assert(model.config.rope_scaling is None)
-
-    configs = {
-        "layer_num": model.config.num_hidden_layers,
-        "head_num": model.config.num_attention_heads,
-        "head_size": model.config.hidden_size // model.config.num_attention_heads,
-        "hidden_size": model.config.hidden_size,
-        "max_position_embeddings": model.config.max_position_embeddings,
-        "rotary_dims": int(model.config.hidden_size // model.config.num_attention_heads),
-        #"gelu_mode": model.config.hidden_act,
-        #"intermediate_size": model.config.intermediate_size,
-        #"num_key_value_heads": model.config.num_key_value_heads,
-        "rms_norm_eps": model.config.rms_norm_eps,
-    }
-
-    consts = {
-        "model.embed_tokens.weight": pt_as_np(model.model.embed_tokens.weight),
-        "model.norm.weight": pt_as_np(model.model.norm.weight),
-        "lm_head.weight": pt_as_np(model.lm_head.weight),
-        "lm_head.bias": pt_as_np(model.lm_head.bias),
-        "layers": [
-            {
-                "model.layers.input_layernorm.weight": pt_as_np(l.input_layernorm.weight),
-                "model.layers.post_attention_layernorm.weight": pt_as_np(l.post_attention_layernorm.weight),
-                "model.layers.self_attn.q_proj.bias": pt_as_np(l.self_attn.q_proj.bias),
-                "model.layers.self_attn.q_proj.weight": pt_as_np(l.self_attn.q_proj.weight),
-                "model.layers.self_attn.k_proj.bias": pt_as_np(l.self_attn.k_proj.bias),
-                "model.layers.self_attn.k_proj.weight": pt_as_np(l.self_attn.k_proj.weight),
-                "model.layers.self_attn.v_proj.bias": pt_as_np(l.self_attn.v_proj.bias),
-                "model.layers.self_attn.v_proj.weight": pt_as_np(l.self_attn.v_proj.weight),
-                "model.layers.self_attn.o_proj.bias": pt_as_np(l.self_attn.o_proj.bias),
-                "model.layers.self_attn.o_proj.weight": pt_as_np(l.self_attn.o_proj.weight),
-                "model.layers.mlp.gate_proj.bias": pt_as_np(l.mlp.gate_proj.bias),
-                "model.layers.mlp.gate_proj.weight": pt_as_np(l.mlp.gate_proj.weight),
-                "model.layers.mlp.up_proj.bias": pt_as_np(l.mlp.up_proj.bias),
-                "model.layers.mlp.up_proj.weight": pt_as_np(l.mlp.up_proj.weight),
-                "model.layers.mlp.down_proj.bias": pt_as_np(l.mlp.down_proj.bias),
-                "model.layers.mlp.down_proj.weight": pt_as_np(l.mlp.down_proj.weight)
-            } for l in model.model.layers
-        ],
-    }
-    cost = time.time() - beg
-    print(f"extracting done, cost {cost:.2f} seconds.\nmodel configs:")
-    for k, v in configs.items():
-        print(f"	{k}: {v}")
-    return configs, consts
+    model = Model([logits],
+                 [input_ids, attention_mask, position_ids, beam_idx])
+    model.outputs[0].get_tensor().set_names({"logits"})
+    return model
 
 
 def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -581,4 +474,8 @@ if __name__ == "__main__":
     cost = time.time() - beg
     print(f"serialize done, cost {cost:.2f} seconds.")
     print(f"save tokenzier to '{args.ov_model_path}' ...")
-    save_tokenzier("meta-llama/Llama-2-7b-chat-hf", args.ov_model_path)
+    # save tokenizer and config to load with GenAI and Optimum
+    model_id = "meta-llama/Llama-2-7b-chat-hf"
+    save_tokenzier(model_id, args.ov_model_path)
+    config = AutoConfig.from_pretrained(model_id)
+    config.save_pretrained(args.ov_model_path)
