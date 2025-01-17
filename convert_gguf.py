@@ -154,11 +154,14 @@ def rope_emb(x, rope_const, position_ids, seq_len=None):
 
 
 def multi_head_attention(query, key, value, 
-                        num_heads, 
+                        num_heads,
                         head_dim,
+                        batch_dim,
+                        layer_idx,
                         mask=None,
                         position_ids=None,
                         rope_const=None,
+                        beam_idx=None,
                         opset=opset):
     """
     Implements multi-head self-attention using OpenVINO operations
@@ -205,6 +208,35 @@ def multi_head_attention(query, key, value,
     if sin is not None and cos is not None:
         #q, k = apply_rotary_embedding(q, k, sin, cos, hidden_dim, opset)
         q, k = apply_rotary_pos_emb(q, k, sin, cos, head_dim)
+
+    default_key = opset.broadcast(opset.constant([0.0], dtype=np.float32),
+                                opset.concat([batch_dim,
+                                            np.int64([num_heads]),
+                                            np.int64([0]),
+                                            np.int64([head_dim])],
+                                            axis=0))
+    k_cache_val = opset.read_value(default_key, 
+                                   variable_shape=ov.PartialShape([-1,num_heads,-1,head_dim]),
+                                   variable_type=Type.f32,
+                                   variable_id=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
+    k_cache = opset.gather(k_cache_val, beam_idx, axis=0)
+    default_value = opset.broadcast(opset.constant([0.0], dtype=np.float32),
+                                opset.concat([batch_dim,
+                                            np.int64([num_heads]),
+                                            np.int64([0]),
+                                            np.int64([head_dim])],
+                                            axis=0))
+    v_cache_val = opset.read_value(default_value, 
+                                   variable_shape=ov.PartialShape([-1,num_heads,-1,head_dim]),
+                                   variable_type=Type.f32,
+                                   variable_id=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
+    v_cache = opset.gather(v_cache_val, beam_idx, axis=0)
+
+    k_combined = opset.concat([k_cache, k], axis=2)
+    v_combined = opset.concat([v_cache, v], axis=2)
+
+    k_assigned = opset.assign(k_combined, f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
+    v_assigned = opset.assign(v_combined, f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
     
     # 3. Calculate attention scores
     # Scale Q by sqrt(head_dim)
@@ -235,7 +267,7 @@ def multi_head_attention(query, key, value,
                           opset.concat([batch_size, seq_len, np.int64([hidden_dim])], axis=0),
                           False)
     
-    return output
+    return output, [k_assigned, v_assigned]
 #=========================================================================
 
 def make_fc(key, input, consts, name_suffix=""):
@@ -300,7 +332,7 @@ def save_tokenzier(orig_model_path, ov_model_path):
 
 
 
-def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, rope_const):
+def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, rope_const, beam_idx, batch_dim):
     name_suffix = f".layer{layer_idx}"
     name_prefix = "model.layers.self_attn"
     # layerNorm operation
@@ -314,12 +346,15 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
     # attn_output = make_mha([q, k, v], kv_cache, beam_table, attn_mask, cos_tab, sin_tab,
     #                        layer_idx, configs["rotary_dims"], configs["hidden_size"], configs["head_num"],
     #                        name=f"{name_prefix}.mha{name_suffix}")
-    attn_output = multi_head_attention(q, k, v,
+    attn_output, sinks = multi_head_attention(q, k, v,
                         configs["head_num"],
                         configs["head_size"],
+                        batch_dim=batch_dim,
+                        layer_idx=layer_idx,
                         mask=attn_mask,
                         position_ids=position_ids,
                         rope_const=rope_const,
+                        beam_idx=beam_idx,
                         opset=opset)
 
 
@@ -340,7 +375,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
     mlp_output = mlp(post_attention_layernorm)
     # residual connection.
     output = opset.add(attn_output, mlp_output, auto_broadcast="numpy", name=f"{name_prefix}.add1{name_suffix}")
-    return output
+    return output, sinks
 
 
 def init_rope(head_dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
@@ -367,8 +402,15 @@ def create_model(configs, consts):
 
     rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"])
 
+    input_shape = opset.shape_of(input_ids)
+    batch_size = opset.gather(input_shape,
+                         opset.constant([0], dtype=np.int64),
+                         opset.constant([0], dtype=np.int64))
+
+    sinks = []
     for i in tqdm(range(configs["layer_num"])):
-        hidden_states = layer(configs, consts, i, hidden_states, attention_mask, position_ids, rope_const)
+        hidden_states, layer_sinks = layer(configs, consts, i, hidden_states, attention_mask, position_ids, rope_const, beam_idx, batch_size)
+        sinks = sinks + layer_sinks
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
     # embed_out
@@ -378,7 +420,7 @@ def create_model(configs, consts):
     logits.set_friendly_name("logits")
     cost = time.time() - beg
     print(f"generate ov model done, cost {cost:.2f} seconds.")
-    model = Model([logits],
+    model = Model([logits], sinks,
                  [input_ids, attention_mask, position_ids, beam_idx])
     model.outputs[0].get_tensor().set_names({"logits"})
     return model
