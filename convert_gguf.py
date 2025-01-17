@@ -146,11 +146,7 @@ def rope_emb(x, rope_const, position_ids, seq_len=None):
     cos = opset.cos(emb)
     sin = opset.sin(emb)
 
-    # Ensure output matches input dtype
-    cos_casted = opset.convert(cos, x.get_element_type())
-    sin_casted = opset.convert(sin, x.get_element_type())
-
-    return cos_casted, sin_casted
+    return cos, sin
 
 
 def multi_head_attention(query, key, value, 
