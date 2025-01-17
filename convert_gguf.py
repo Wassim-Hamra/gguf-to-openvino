@@ -297,17 +297,17 @@ def make_mvn(key, input, consts, configs, name_suffix=""):
         mvn = opset.add(mvn, bias, auto_broadcast="numpy", name=f"{key}.add{name_suffix}")
     return mvn
 
-def make_rms_norm(key, input, consts, epsilon, name_suffix=""):
+def make_rms_norm(key, input, consts, epsilon):
     weights = opset.constant(consts[f"{key}.weight"].astype(np.float32), Type.f32)
-    epsilon_c = opset.constant(epsilon, Type.f32)
+    epsilon_c = opset.constant(np.float32([[[epsilon]]]))
     #pow = opset.multiply(input, input, name=f"{key}.pow{name_suffix}")
-    pow = opset.power(input, np.array([2], np.float32), name=f"{key}.pow{name_suffix}")
-    variance = opset.reduce_mean(pow, reduction_axes=[-1], keep_dims=True, name=f"{key}.var{name_suffix}")
-    add = opset.add(variance, epsilon_c, name=f"{key}.add{name_suffix}")
-    sqrt = opset.sqrt(add, name=f"{key}.sqrt{name_suffix}")
-    div = opset.divide(weights, sqrt, name=f"{key}.div{name_suffix}")
-    mul = opset.multiply(div, input, auto_broadcast="numpy", name=f"{key}.mul{name_suffix}")
-    return opset.convert(mul, input.get_element_type())
+    pow = opset.power(input, np.array([2], np.float32))
+    variance = opset.reduce_mean(pow, reduction_axes=[-1], keep_dims=True)
+    add = opset.add(variance, epsilon_c)
+    sqrt = opset.sqrt(add)
+    div = opset.divide(weights, sqrt)
+    mul = opset.multiply(div, input, auto_broadcast="numpy")
+    return mul
 
 def make_embedding(key, input, consts):
     embed_in_const = Constant(consts[key], True)
@@ -335,7 +335,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
     name_suffix = f".layer{layer_idx}"
     name_prefix = "model.layers.self_attn"
     # layerNorm operation
-    input_layernorm = make_rms_norm("model.layers.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"], name_suffix)
+    input_layernorm = make_rms_norm("model.layers.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
     k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
@@ -360,7 +360,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
     attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx], name_suffix)
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
-    post_attention_layernorm = make_rms_norm("model.layers.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"], name_suffix)
+    post_attention_layernorm = make_rms_norm("model.layers.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
