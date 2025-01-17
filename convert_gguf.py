@@ -77,7 +77,7 @@ def create_attention_mask(input_shape, opset):
     # Create a matrix of shape [seq_len, seq_len] filled with ones in upper triangle
     mask = np.triu(np.ones((seq_len, seq_len)), k=1)
     # Convert to float32 and negate to get proper attention mask (0 for attend, -inf for mask)
-    mask = -10000.0 * mask
+    mask = -65504 * mask
     return opset.constant(mask, Type.f32)
 
 def rotate_half(x, head_dim):
@@ -115,7 +115,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, head_dim, unsqueeze_dim=1):
     return q_rotated, k_rotated
 
 
-def rope_emb(x, rope_const, position_ids, seq_len=None):
+def rope_emb(x, rope_const, position_ids, batch_dim):
     """
     Generates Rotary Position Embedding (RoPE) cosine and sine components using OpenVINO.
 
@@ -123,18 +123,21 @@ def rope_emb(x, rope_const, position_ids, seq_len=None):
         x: The input tensor to determine the device and dtype (OpenVINO node).
         rope_const: Tensor containing the rotary embedding constants (OpenVINO node).
         position_ids: Tensor with position IDs (OpenVINO node).
-        seq_len: Optional sequence length (not used in computation here).
+        batch_dim: batch dimension
 
     Returns:
         cos: Cosine component of the rotary embedding.
         sin: Sine component of the rotary embedding.
     """
     # Expand dimensions for broadcasting
-    inv_freq_expanded = opset.unsqueeze(rope_const, 0)  # Add batch dimension: [1, head_dim]
-    inv_freq_expanded = opset.unsqueeze(inv_freq_expanded, -1)  # Shape: [1, head_dim, 1]
-
     position_ids_expanded = opset.convert(opset.unsqueeze(position_ids, 1), Type.f32)  # Add head_dim axis: [batch_size, 1, seq_len]
 
+    # Broadcast RoPE to batch dimension
+    inv_freq_expanded = opset.broadcast(rope_const,
+                                        target_shape=opset.concat([batch_dim,
+                                                      np.int64([1]),
+                                                      np.int64([1])], axis=0),
+                                        broadcast_spec="BIDIRECTIONAL")
     # Compute frequencies
     freqs = opset.matmul(inv_freq_expanded, position_ids_expanded, transpose_a=False, transpose_b=False)  # Shape: [batch_size, seq_len, head_dim]
     freqs_transposed = opset.transpose(freqs, [0, 2, 1])  # Transpose to shape: [batch_size, head_dim, seq_len]
@@ -198,7 +201,7 @@ def multi_head_attention(query, key, value,
     k = split_heads(key, "key")
     v = split_heads(value, "value")
 
-    sin, cos = rope_emb(v, rope_const, position_ids)
+    sin, cos = rope_emb(v, rope_const, position_ids, batch_dim)
     
     # 2. Apply rotary embeddings if provided
     if sin is not None and cos is not None:
@@ -376,6 +379,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
 
 def init_rope(head_dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float().to(device) / head_dim))
+    inv_freq = inv_freq[None, :, None]
     # For BC we register cos and sin cached
     rope_const = opset.constant(inv_freq.numpy(), Type.f32)
     return rope_const
