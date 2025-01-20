@@ -278,9 +278,8 @@ def rope_emb(x, rope_const, position_ids, batch_dim):
     return cos, sin
 
 
-def multi_head_attention(query, key, value, 
-                        num_heads,
-                        head_dim,
+def multi_head_attention(query, key, value,
+                        configs,
                         batch_dim,
                         layer_idx,
                         hidden_dim,
@@ -304,19 +303,22 @@ def multi_head_attention(query, key, value,
         cos: Optional cosine component for rotary embeddings
         opset: OpenVINO operation set to use
     """
+    num_heads = configs["head_num"]
+    head_dim = configs["head_size"]
+    num_heads_kv = configs["head_num_kv"]
     hidden_size = num_heads * head_dim
     
     # 1. Reshape Q, K, V to split heads
-    def split_heads(x, name):
+    def split_heads(x, num_heads, head_dim):
         # Reshape from [batch, seq_len, hidden_dim] to [batch, seq_len, num_heads, head_dim]
         x = opset.reshape(x, [0, 0, num_heads, head_dim], special_zero=True)
         # Transpose to [batch, num_heads, seq_len, head_dim]
-        x = opset.transpose(x, [0, 2, 1, 3], name=f"{name}_transpose")
+        x = opset.transpose(x, [0, 2, 1, 3])
         return x
     
-    q = split_heads(query, "query")
-    k = split_heads(key, "key")
-    v = split_heads(value, "value")
+    q = split_heads(query, num_heads, head_dim)
+    k = split_heads(key, num_heads_kv, head_dim)
+    v = split_heads(value, num_heads_kv, head_dim)
 
     cos = None
     sin = None
@@ -328,23 +330,23 @@ def multi_head_attention(query, key, value,
 
     default_key = opset.broadcast(opset.constant(0.0, dtype=np.float32),
                                 opset.concat([batch_dim,
-                                            np.int64([num_heads]),
+                                            np.int64([num_heads_kv]),
                                             np.int64([0]),
                                             np.int64([head_dim])],
                                             axis=0))
     k_cache_val = opset.read_value(default_key, 
-                                   variable_shape=ov.PartialShape([-1,num_heads,-1,head_dim]),
+                                   variable_shape=ov.PartialShape([-1,num_heads_kv,-1,head_dim]),
                                    variable_type=Type.f32,
                                    variable_id=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
     k_cache = opset.gather(k_cache_val, beam_idx, opset.constant(0, dtype=np.int64), batch_dims=0)
-    default_value = opset.broadcast(opset.constant([0.0], dtype=np.float32),
+    default_value = opset.broadcast(opset.constant(0.0, dtype=np.float32),
                                 opset.concat([batch_dim,
-                                            np.int64([num_heads]),
+                                            np.int64([num_heads_kv]),
                                             np.int64([0]),
                                             np.int64([head_dim])],
                                             axis=0))
     v_cache_val = opset.read_value(default_value, 
-                                   variable_shape=ov.PartialShape([-1,num_heads,-1,head_dim]),
+                                   variable_shape=ov.PartialShape([-1,num_heads_kv,-1,head_dim]),
                                    variable_type=Type.f32,
                                    variable_id=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
     v_cache = opset.gather(v_cache_val, beam_idx, opset.constant(0, dtype=np.int64), batch_dims=0)
@@ -354,11 +356,38 @@ def multi_head_attention(query, key, value,
 
     k_assigned = opset.assign(k_combined, f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
     v_assigned = opset.assign(v_combined, f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
-    
+
+    if num_heads == num_heads_kv:
+        k_reshaped = k_combined
+        v_reshaped = v_combined
+    else:
+        kv_per_head = num_heads // num_heads_kv
+        k_combined_unsq = opset.unsqueeze(k_combined, opset.constant(2, dtype=np.int64))
+        k_combined_broad = opset.broadcast(k_combined_unsq,
+                                           opset.concat([batch_dim,
+                                                np.int64([kv_per_head]),
+                                                np.int64([num_heads_kv]),
+                                                np.int64([0]),
+                                                np.int64([head_dim])],
+                                                axis=0),
+                                            broadcast_spec="BIDIRECTIONAL")
+        k_reshaped = opset.reshape(k_combined_broad, [0, num_heads, -1, head_dim], special_zero=True)
+
+        v_combined_unsq = opset.unsqueeze(v_combined, opset.constant(2, dtype=np.int64))
+        v_combined_broad = opset.broadcast(v_combined_unsq,
+                                           opset.concat([batch_dim,
+                                                np.int64([kv_per_head]),
+                                                np.int64([num_heads_kv]),
+                                                np.int64([0]),
+                                                np.int64([head_dim])],
+                                                axis=0),
+                                            broadcast_spec="BIDIRECTIONAL")
+        v_reshaped = opset.reshape(v_combined_broad, [0, num_heads, -1, head_dim], special_zero=True)
+
     # 3. Calculate attention
     scale = opset.constant(np.float32(1.0 / np.sqrt(head_dim)))
     
-    attention_output = opset.scaled_dot_product_attention(q, k_combined, v_combined, mask, scale)
+    attention_output = opset.scaled_dot_product_attention(q, k_reshaped, v_reshaped, mask, scale)
     
     # 4. Reshape output
     # Transpose back to [batch, seq_len, num_heads, head_dim]
@@ -376,7 +405,7 @@ def make_fc(key, input, consts, name_suffix=""):
     # weight const f32 NxK
     weight = consts[f"{key}.weight"]
 
-    weights = Constant(weight, True)
+    weights = opset.constant(weight, dtype=np.float16)
     weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
     w_f32 = opset.convert(weights, Type.f32)
 
@@ -384,7 +413,7 @@ def make_fc(key, input, consts, name_suffix=""):
 
     # add bias
     if consts[f"{key}.bias"] is not None:
-        bias = Constant(consts[f"{key}.bias"], True)
+        bias = opset.constant(consts[f"{key}.bias"], dtype=np.float16)
         bias.set_friendly_name(name=f"{key}.bias{name_suffix}")
         matmul = opset.add(matmul, bias, auto_broadcast="numpy")
 
@@ -404,8 +433,8 @@ def make_rms_norm(key, input, consts, epsilon):
     weights = opset.constant(consts[f"{key}.weight"].astype(np.float32), Type.f32)
     epsilon_c = opset.constant(np.float32([[[epsilon]]]))
     #pow = opset.multiply(input, input, name=f"{key}.pow{name_suffix}")
-    pow = opset.power(input, np.array([2], np.float32))
-    variance = opset.reduce_mean(pow, reduction_axes=[-1], keep_dims=True)
+    pow = opset.power(input, np.array([[[2]]], np.float32))
+    variance = opset.reduce_mean(pow, opset.constant([-1], dtype=np.int64), keep_dims=True)
     add = opset.add(variance, epsilon_c)
     sqrt = opset.sqrt(add)
     div = opset.divide(weights, sqrt)
@@ -456,8 +485,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
         causal_mask = create_causal_mask(attn_mask, k, input_layernorm, hidden_dim, input_shape)
 
     attn_output, sinks, cos_sin_cached = multi_head_attention(q, k, v,
-                        configs["head_num"],
-                        configs["head_size"],
+                        configs,
                         batch_dim=batch_dim,
                         layer_idx=layer_idx,
                         hidden_dim=hidden_dim,
@@ -542,7 +570,7 @@ def create_model(configs, consts):
     return model
 
 
-def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Extract configurations and weights from GGUF model"""
     print(f"extracting from GGUF model '{model_path}'...")
     beg = time.time()
@@ -556,6 +584,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "layer_num": metadata["llama.block_count"].item(),
         "head_num": metadata["llama.attention.head_count"].item(),
         "head_size": metadata["llama.embedding_length"].item() // metadata["llama.attention.head_count"].item(),
+        "head_num_kv": metadata.get("llama.attention.head_count_kv", metadata["llama.attention.head_count"]).item(),
         "hidden_size": metadata["llama.embedding_length"].item(),
         "max_position_embeddings": metadata.get("llama.context_length", np.int32([2048])).item(),
         "rotary_dims": metadata["llama.rope.dimension_count"].item(),
@@ -567,10 +596,12 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     # Extract weights and biases
     print("Extract weights and biases")
     print('weights["token_embd.weight"]: ', type(weights["token_embd.weight"]))
+    print("============= Weight keys ============")
+    print(list(weights.keys()))
     consts = {
         "model.embed_tokens.weight": np.array(weights["token_embd.weight"]),
         "model.norm.weight": np.array(weights["output_norm.weight"]),
-        "lm_head.weight": np.array(weights["output.weight"]),
+        "lm_head.weight": np.array(weights[lm_head_weights_name]) if lm_head_weights_name is not None else np.array(weights["token_embd.weight"]),
         "lm_head.bias": None,  # GGUF models typically don"t have this bias
         "layers": []
     }
@@ -609,6 +640,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("")
     parser.add_argument("--org_model_path", type=str, default="Model ID (can be a Hugginface Hub id, or a local directory)")
     parser.add_argument("--ov_model_path", type=str, nargs="?", default="./gen/llama-2-7b-chat/")
+    parser.add_argument("--lm_head_name", type=str, nargs="?", default=None)
     parser.add_argument("--compressed_weight", type=bool, nargs="?", default=False)
     parser.add_argument("--quant_type", type=str, nargs="?", default="")
     args = parser.parse_args()
@@ -624,7 +656,7 @@ if __name__ == "__main__":
         args.ov_model_path = os.path.join(args.ov_model_path, args.quant_type)
     os.makedirs(args.ov_model_path, exist_ok=True)
 
-    model_configs, consts = load_gguf_model(args.org_model_path)
+    model_configs, consts = load_gguf_model(args.org_model_path, args.lm_head_name)
     model = create_model(model_configs, consts)
     show_model(model)
     print(f"serialize ov model to '{args.ov_model_path}'...")
@@ -634,7 +666,7 @@ if __name__ == "__main__":
     print(f"serialize done, cost {cost:.2f} seconds.")
     print(f"save tokenzier to '{args.ov_model_path}' ...")
     # save tokenizer and config to load with GenAI and Optimum
-    model_id = "meta-llama/Llama-2-7b-chat-hf"
+    model_id = "HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
     save_tokenzier(model_id, args.ov_model_path)
     config = AutoConfig.from_pretrained(model_id)
     config.save_pretrained(args.ov_model_path)
