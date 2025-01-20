@@ -81,7 +81,7 @@ def create_attention_mask(input_shape, opset):
     return opset.constant(mask, Type.f32)
 
 
-def create_causal_mask(attention_mask, keys, hidden_state):
+def create_causal_mask(attention_mask, keys, hidden_state, hidden_dim, input_shape):
     # Extract shape of attention mask
     t130 = opset.shape_of(attention_mask, output_type=Type.i64)
     t131 = opset.constant(1, dtype=np.int64)
@@ -91,7 +91,7 @@ def create_causal_mask(attention_mask, keys, hidden_state):
     # Reshape and construct new shapes
     t134 = opset.constant([1], dtype=np.int64)
     t135 = opset.reshape(t133, t134, special_zero=False)
-    t40 = opset.shape_of(hidden_state)
+    t40 = input_shape
     t127 = opset.gather(t40, opset.constant(1, dtype=np.int64), axis=0)
     t129 = opset.reshape(t127, opset.constant([1], dtype=np.int64), special_zero=False) 
     t136 = opset.concat([t129, t135], axis=0, name="ListConstruct")
@@ -166,13 +166,12 @@ def create_causal_mask(attention_mask, keys, hidden_state):
     t188 = opset.reshape(t187, t184, special_zero=False)
     t189 = opset.constant([0], dtype=np.int64)
     t190 = opset.constant([1], dtype=np.int64)
-    t61 = opset.constant([3], dtype=np.int64)
-    t191 = opset.slice(t188, t189, t135, t190, t61)
+    t191 = opset.slice(t188, t189, t135, t190, hidden_dim)
     t192 = opset.constant([-1, 1], dtype=np.int64)
     t193 = opset.reshape(t191, t192, special_zero=False)
     t194 = opset.constant([0], dtype=np.int64)
     t195 = opset.constant([1], dtype=np.int64)
-    t196 = opset.slice(t180, t194, t135, t195, t61)
+    t196 = opset.slice(t180, t194, t135, t195, hidden_dim)
     #------- Verified ---------#
     t197 = opset.unsqueeze(attention_mask, t48)
     t198 = opset.constant(2, dtype=np.int64)
@@ -194,23 +193,27 @@ def create_causal_mask(attention_mask, keys, hidden_state):
     t214 = opset.reshape(t164, t213, special_zero=False)
     t215 = opset.add(t214, t129, auto_broadcast='numpy')
     t216 = opset.constant([1], dtype=np.int64)
-    t217 = opset.slice(t211, t212, t215, t216, t61)
+    t217 = opset.slice(t211, t212, t215, t216, hidden_dim)
     return t217
 
 
-def rotate_half(x, head_dim):
+def rotate_half(x, head_size, axis):
     """Rotates half the hidden dimensions of the input tensor."""
-    split_dim = head_dim // 2 #x.get_shape()[-1] // 2
-    shape_of = opset.shape_of(x)
-    gather = opset.gather(shape_of, indices=np.int64([0, 1, 2]), axis=np.int64(0))
-    x1 = opset.slice(x, [0, 0, 0, 0], opset.concat([gather, np.int64([split_dim])], axis=0), [1, 1, 1, 1], axes=[0, 1, 2, 3])
-    x2 = opset.slice(x, [0, 0, 0, split_dim], opset.concat([gather, np.int64([head_dim])], axis=0), [1, 1, 1, 1], axes=[0, 1, 2, 3])
-    neg_x2 = opset.multiply(x2, opset.constant(-1.0, Type.f32))
-    rotated = opset.concat([neg_x2, x1], axis=-1)
+    t58 = opset.constant([head_size // 2], dtype=np.int64)
+    t59 = opset.constant([9223372036854775807], dtype=np.int64)
+    t60 = opset.constant([1], dtype=np.int64)
+    t62 = opset.slice(x, t58, t59, t60, axis)
+    t63 = opset.constant([[[[-1.0]]]], dtype=np.float32)
+    t64 = opset.multiply(t62, t63)
+    t65 = opset.constant([0], dtype=np.int64)
+    t66 = opset.constant([head_size // 2], dtype=np.int64)
+    t67 = opset.constant([1], dtype=np.int64)
+    t68 = opset.slice(x, t65, t66, t67, axis)
+    rotated = opset.concat([t64, t68], axis=-1)
     return rotated
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, head_dim, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, head_size, hidden_dim, cos_sin_cached, unsqueeze_dim=1):
     """
     Applies Rotary Position Embedding to the query and key tensors using OpenVINO API.
 
@@ -224,14 +227,18 @@ def apply_rotary_pos_emb(q, k, cos, sin, head_dim, unsqueeze_dim=1):
         Tuple of (q_rotated, k_rotated) tensors.
     """
     # Unsqueeze cos and sin along the specified dimension
-    cos_unsqueezed = opset.unsqueeze(cos, np.int64(unsqueeze_dim))
-    sin_unsqueezed = opset.unsqueeze(sin, np.int64(unsqueeze_dim))
+    if cos_sin_cached is None:
+        cos_unsqueezed = opset.unsqueeze(cos, np.int64(unsqueeze_dim))
+        sin_unsqueezed = opset.unsqueeze(sin, np.int64(unsqueeze_dim))
+    else:
+        cos_unsqueezed = cos_sin_cached[0]
+        sin_unsqueezed = cos_sin_cached[1]
 
     # Apply Rotary Positional Embedding
-    q_rotated = opset.add(opset.multiply(q, cos_unsqueezed), opset.multiply(rotate_half(q, head_dim), sin_unsqueezed))
-    k_rotated = opset.add(opset.multiply(k, cos_unsqueezed), opset.multiply(rotate_half(k, head_dim), sin_unsqueezed))
+    q_rotated = opset.add(opset.multiply(q, cos_unsqueezed), opset.multiply(rotate_half(q, head_size, hidden_dim), sin_unsqueezed))
+    k_rotated = opset.add(opset.multiply(k, cos_unsqueezed), opset.multiply(rotate_half(k, head_size, hidden_dim), sin_unsqueezed))
 
-    return q_rotated, k_rotated
+    return q_rotated, k_rotated, (cos, sin)
 
 
 def rope_emb(x, rope_const, position_ids, batch_dim):
@@ -276,11 +283,13 @@ def multi_head_attention(query, key, value,
                         head_dim,
                         batch_dim,
                         layer_idx,
+                        hidden_dim,
+                        output_shape,
                         mask=None,
                         position_ids=None,
                         rope_const=None,
                         beam_idx=None,
-                        opset=opset):
+                        cos_sin_cached=None):
     """
     Implements multi-head self-attention using OpenVINO operations
     
@@ -295,23 +304,12 @@ def multi_head_attention(query, key, value,
         cos: Optional cosine component for rotary embeddings
         opset: OpenVINO operation set to use
     """
-    batch_size = opset.slice(opset.shape_of(query),
-                         opset.constant([0], dtype=np.int64),
-                         opset.constant([1], dtype=np.int64),
-                         opset.constant([1], dtype=np.int64))
-    #batch_size = opset.squeeze(batch_size, axes=opset.constant([0]))
-    seq_len = opset.slice(opset.shape_of(query),
-                         opset.constant([1], dtype=np.int64),
-                         opset.constant([2], dtype=np.int64),
-                         opset.constant([1], dtype=np.int64))
-    #seq_len = opset.squeeze(seq_len, axes=opset.constant([0]))
-    hidden_dim = num_heads * head_dim
+    hidden_size = num_heads * head_dim
     
     # 1. Reshape Q, K, V to split heads
     def split_heads(x, name):
         # Reshape from [batch, seq_len, hidden_dim] to [batch, seq_len, num_heads, head_dim]
-        shape = opset.concat([batch_size, seq_len, np.int64([num_heads]), np.int64([head_dim])], axis=0)
-        x = opset.reshape(x, shape, False)
+        x = opset.reshape(x, [0, 0, num_heads, head_dim], special_zero=True)
         # Transpose to [batch, num_heads, seq_len, head_dim]
         x = opset.transpose(x, [0, 2, 1, 3], name=f"{name}_transpose")
         return x
@@ -320,12 +318,15 @@ def multi_head_attention(query, key, value,
     k = split_heads(key, "key")
     v = split_heads(value, "value")
 
-    sin, cos = rope_emb(v, rope_const, position_ids, batch_dim)
+    cos = None
+    sin = None
+    if cos_sin_cached is None:
+        sin, cos = rope_emb(v, rope_const, position_ids, batch_dim)
     
     # 2. Apply rotary embeddings if provided
     if sin is not None and cos is not None:
         #q, k = apply_rotary_embedding(q, k, sin, cos, hidden_dim, opset)
-        q, k = apply_rotary_pos_emb(q, k, sin, cos, head_dim)
+        q, k, cos_sin_cached = apply_rotary_pos_emb(q, k, sin, cos, head_dim, hidden_dim, cos_sin_cached)
 
     default_key = opset.broadcast(opset.constant([0.0], dtype=np.float32),
                                 opset.concat([batch_dim,
@@ -337,7 +338,7 @@ def multi_head_attention(query, key, value,
                                    variable_shape=ov.PartialShape([-1,num_heads,-1,head_dim]),
                                    variable_type=Type.f32,
                                    variable_id=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
-    k_cache = opset.gather(k_cache_val, beam_idx, axis=0)
+    k_cache = opset.gather(k_cache_val, beam_idx, opset.constant(0, dtype=np.int64), batch_dims=0)
     default_value = opset.broadcast(opset.constant([0.0], dtype=np.float32),
                                 opset.concat([batch_dim,
                                             np.int64([num_heads]),
@@ -348,7 +349,7 @@ def multi_head_attention(query, key, value,
                                    variable_shape=ov.PartialShape([-1,num_heads,-1,head_dim]),
                                    variable_type=Type.f32,
                                    variable_id=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
-    v_cache = opset.gather(v_cache_val, beam_idx, axis=0)
+    v_cache = opset.gather(v_cache_val, beam_idx, opset.constant(0, dtype=np.int64), batch_dims=0)
 
     k_combined = opset.concat([k_cache, k], axis=2)
     v_combined = opset.concat([v_cache, v], axis=2)
@@ -367,10 +368,10 @@ def multi_head_attention(query, key, value,
     
     # Combine heads: [batch, seq_len, hidden_dim]
     output = opset.reshape(context_transposed,
-                          opset.concat([batch_size, seq_len, np.int64([hidden_dim])], axis=0),
-                          False)
+                          output_shape,
+                          special_zero=False)
     
-    return output, [k_assigned, v_assigned]
+    return output, [k_assigned, v_assigned], cos_sin_cached
 #=========================================================================
 
 def make_fc(key, input, consts, name_suffix=""):
@@ -381,13 +382,13 @@ def make_fc(key, input, consts, name_suffix=""):
     weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
     w_f32 = opset.convert(weights, Type.f32)
 
-    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True, name=f"{key}.matmul{name_suffix}")
+    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
 
     # add bias
     if consts[f"{key}.bias"] is not None:
         bias = Constant(consts[f"{key}.bias"], True)
         bias.set_friendly_name(name=f"{key}.bias{name_suffix}")
-        matmul = opset.add(matmul, bias, auto_broadcast="numpy", name=f"{key}.add{name_suffix}")
+        matmul = opset.add(matmul, bias, auto_broadcast="numpy")
 
     return matmul
 
@@ -434,8 +435,7 @@ def save_tokenzier(orig_model_path, ov_model_path):
         ov.save_model(model, Path(ov_model_path) / file_name)
 
 
-
-def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, position_ids, rope_const, beam_idx, batch_dim):
+def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, position_ids, rope_const, beam_idx, batch_dim, hidden_dim, cos_sin_cached, output_shape):
     name_suffix = f".layer{layer_idx}"
     name_prefix = "model.layers.self_attn"
     # layerNorm operation
@@ -445,24 +445,30 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
     v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
 
-    if causal_mask is None:
-        causal_mask = create_causal_mask(attn_mask, k, input_layernorm)
+    input_shape = opset.shape_of(input_layernorm)
+    if output_shape is None:
+        output_shape = opset.concat([opset.gather(input_shape,
+                                                 opset.constant([0, 1], dtype=np.int64),
+                                                 axis=0,
+                                                 batch_dims=0),
+                                    opset.constant([-1], dtype=np.int64)],
+                                    axis=0)
 
-    # custom op
-    # attn_output = make_mha([q, k, v], kv_cache, beam_table, attn_mask, cos_tab, sin_tab,
-    #                        layer_idx, configs["rotary_dims"], configs["hidden_size"], configs["head_num"],
-    #                        name=f"{name_prefix}.mha{name_suffix}")
-    attn_output, sinks = multi_head_attention(q, k, v,
+    if causal_mask is None:
+        causal_mask = create_causal_mask(attn_mask, k, input_layernorm, hidden_dim, input_shape)
+
+    attn_output, sinks, cos_sin_cached = multi_head_attention(q, k, v,
                         configs["head_num"],
                         configs["head_size"],
                         batch_dim=batch_dim,
                         layer_idx=layer_idx,
+                        hidden_dim=hidden_dim,
+                        output_shape=output_shape,
                         mask=causal_mask,
                         position_ids=position_ids,
                         rope_const=rope_const,
                         beam_idx=beam_idx,
-                        opset=opset)
-
+                        cos_sin_cached=cos_sin_cached)
 
     attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx], name_suffix)
 
@@ -481,7 +487,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     mlp_output = mlp(post_attention_layernorm)
     # residual connection.
     output = opset.add(attn_output, mlp_output, auto_broadcast="numpy", name=f"{name_prefix}.add1{name_suffix}")
-    return output, sinks, causal_mask
+    return output, sinks, causal_mask, cos_sin_cached, output_shape
 
 
 def init_rope(head_dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
@@ -513,11 +519,15 @@ def create_model(configs, consts):
     batch_size = opset.gather(input_shape,
                          opset.constant([0], dtype=np.int64),
                          opset.constant([0], dtype=np.int64))
+    hidden_dim = opset.constant([3], dtype=np.int64)
 
     sinks = []
+    # Shared tensors across all the Transformer blocks
     causal_mask = None
+    cos_sin_cached = None
+    output_shape = None
     for i in tqdm(range(configs["layer_num"])):
-        hidden_states, layer_sinks, causal_mask = layer(configs, consts, i, hidden_states, attention_mask, causal_mask, position_ids, rope_const, beam_idx, batch_size)
+        hidden_states, layer_sinks, causal_mask, cos_sin_cached, output_shape = layer(configs, consts, i, hidden_states, attention_mask, causal_mask, position_ids, rope_const, beam_idx, batch_size, hidden_dim, cos_sin_cached, output_shape)
         sinks = sinks + layer_sinks
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
