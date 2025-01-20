@@ -80,6 +80,124 @@ def create_attention_mask(input_shape, opset):
     mask = -65504 * mask
     return opset.constant(mask, Type.f32)
 
+
+def create_causal_mask(attention_mask, keys, hidden_state):
+    # Extract shape of attention mask
+    t130 = opset.shape_of(attention_mask, output_type=Type.i64)
+    t131 = opset.constant(1, dtype=np.int64)
+    t132 = opset.constant(0, dtype=np.int64)
+    t133 = opset.gather(t130, t131, t132, batch_dims=0)
+    
+    # Reshape and construct new shapes
+    t134 = opset.constant([1], dtype=np.int64)
+    t135 = opset.reshape(t133, t134, special_zero=False)
+    t40 = opset.shape_of(hidden_state)
+    t127 = opset.gather(t40, opset.constant(1, dtype=np.int64), axis=0)
+    t129 = opset.reshape(t127, opset.constant([1], dtype=np.int64), special_zero=False) 
+    t136 = opset.concat([t129, t135], axis=0, name="ListConstruct")
+    min_shape_val = opset.constant([1, 1], dtype=np.int64)
+    t137 = opset.maximum(min_shape_val, t136, auto_broadcast="numpy")
+    t138 = opset.broadcast(opset.constant(-65504, dtype=np.float32), t137, broadcast_spec="NUMPY")
+    
+    # Create upper triangular mask for causal masking
+    t139 = opset.shape_of(t138, output_type=Type.i32)
+    t140 = opset.constant(1, dtype=np.int64)
+    t141 = opset.constant(0, dtype=np.int64)
+    t142 = opset.gather(t139, t140, t141, batch_dims=0)
+    t143 = opset.constant(1, dtype=np.int32)
+    
+    # Define ranges for the causal mask
+    zero_const = opset.constant(0, dtype=np.int32)
+    t144 = opset.range(zero_const, t142, t143, output_type=Type.i32)
+    t145 = opset.unsqueeze(t144, axes=zero_const)
+    t146 = opset.constant(1, dtype=np.int32)
+    t147 = opset.constant(0, dtype=np.int64)
+    t148 = opset.constant(0, dtype=np.int64)
+    
+    # Broadcast causal mask
+    t149 = opset.gather(t139, t147, t148, batch_dims=0)
+    t150 = opset.add(t149, t146, auto_broadcast="numpy")
+    t151 = opset.range(t146, t150, t143, output_type=Type.i32)
+    t152 = opset.unsqueeze(t151, axes=t143)
+    t153 = opset.greater_equal(t145, t152, auto_broadcast="numpy")
+    
+    # Create a causal mask using a selective operation
+    t154 = opset.constant(0.0, dtype=np.float32)
+    t155 = opset.select(t153, t138, t154, auto_broadcast="numpy")
+    
+    # Next branch
+    t157 = opset.constant(1, dtype=np.int32)
+    t156 = opset.constant(0, dtype=np.int64)
+    t158 = opset.range(t156, t133, t157, output_type=Type.f32)
+    t159 = opset.convert(t158, destination_type=np.int64)
+    t160 = opset.convert(t159, destination_type=np.float32)
+    t161 = opset.shape_of(keys, output_type=Type.i64)
+    t162 = opset.constant(2, dtype=np.int64)
+    t163 = opset.constant(0, dtype=np.int64)
+    t164 = opset.gather(t161, t162, t163, batch_dims=0)
+    t165 = opset.add(t164, t127, auto_broadcast='numpy')
+    t166 = opset.constant(1, dtype=np.int32)
+    t167 = opset.range(t164, t165, t166, output_type=Type.f32)
+    t168 = opset.constant([-1, 1], dtype=np.int64)
+    t169 = opset.reshape(t167, t168, special_zero=False)
+    t170 = opset.greater(t160, t169, auto_broadcast='numpy')
+    t171 = opset.convert(t170, destination_type=np.float32)
+    
+    t172 = opset.multiply(t155, t171, auto_broadcast='numpy')
+    t173 = opset.constant(0, dtype=np.int64)
+    t174 = opset.unsqueeze(t172, t173)
+    t48 = opset.constant(1, dtype=np.int64)
+    t175 = opset.unsqueeze(t174, t48)
+    t41 = opset.constant([0], dtype=np.int64)
+    t42 = opset.constant(0, dtype=np.int64)
+    t43 = opset.gather(t40, t41, t42, batch_dims=0)
+    t176 = opset.constant([1], dtype=np.int64)
+    t177 = opset.constant([1], dtype=np.int64)
+    t178 = opset.constant([1], dtype=np.int64)
+    t179 = opset.concat([t43, t176, t177, t178], axis=0)
+    t180 = opset.broadcast(t175, t179, broadcast_spec="bidirectional")
+    t181 = opset.constant([-1], dtype=np.int64)
+    t182 = opset.reshape(t180, t181, special_zero=False)
+    t183 = opset.constant(0, dtype=np.int64)
+    t184 = opset.shape_of(t180, output_type=Type.i64)
+    t185 = opset.reduce_prod(t184, t183, keep_dims=False)
+    t186 = opset.constant(1, dtype=np.int64)
+    t187 = opset.range(t183, t185, t186, output_type=Type.i64)
+    t188 = opset.reshape(t187, t184, special_zero=False)
+    t189 = opset.constant([0], dtype=np.int64)
+    t190 = opset.constant([1], dtype=np.int64)
+    t61 = opset.constant([3], dtype=np.int64)
+    t191 = opset.slice(t188, t189, t135, t190, t61)
+    t192 = opset.constant([-1, 1], dtype=np.int64)
+    t193 = opset.reshape(t191, t192, special_zero=False)
+    t194 = opset.constant([0], dtype=np.int64)
+    t195 = opset.constant([1], dtype=np.int64)
+    t196 = opset.slice(t180, t194, t135, t195, t61)
+    #------- Verified ---------#
+    t197 = opset.unsqueeze(attention_mask, t48)
+    t198 = opset.constant(2, dtype=np.int64)
+    t199 = opset.unsqueeze(t197, t198)
+    t200 = opset.convert(t199, destination_type=np.float32)
+    t201 = opset.add(t196, t200, auto_broadcast='numpy')
+    t202 = opset.constant([[[[0.0]]]], dtype=np.float32)
+    t203 = opset.equal(t201, t202, auto_broadcast='numpy')
+    t204 = opset.constant(-65504.0, dtype=np.float32)
+    t205 = opset.select(t203, t204, t196, auto_broadcast='numpy')
+    t206 = opset.shape_of(t196, output_type=Type.i64)
+    t207 = opset.broadcast(t205, t206, broadcast_spec="NUMPY")
+    t208 = opset.constant([-1], dtype=np.int64)
+    t209 = opset.reshape(t207, t208, special_zero=False)
+    t210 = opset.scatter_nd_update(t182, t193, t209)
+    t211 = opset.reshape(t210, t184, special_zero=False)
+    t212 = opset.constant([0], dtype=np.int64)
+    t213 = opset.constant([1], dtype=np.int64)
+    t214 = opset.reshape(t164, t213, special_zero=False)
+    t215 = opset.add(t214, t129, auto_broadcast='numpy')
+    t216 = opset.constant([1], dtype=np.int64)
+    t217 = opset.slice(t211, t212, t215, t216, t61)
+    return t217
+
+
 def rotate_half(x, head_dim):
     """Rotates half the hidden dimensions of the input tensor."""
     split_dim = head_dim // 2 #x.get_shape()[-1] // 2
@@ -90,6 +208,7 @@ def rotate_half(x, head_dim):
     neg_x2 = opset.multiply(x2, opset.constant(-1.0, Type.f32))
     rotated = opset.concat([neg_x2, x1], axis=-1)
     return rotated
+
 
 def apply_rotary_pos_emb(q, k, cos, sin, head_dim, unsqueeze_dim=1):
     """
@@ -237,29 +356,14 @@ def multi_head_attention(query, key, value,
     k_assigned = opset.assign(k_combined, f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
     v_assigned = opset.assign(v_combined, f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
     
-    # 3. Calculate attention scores
-    # Scale Q by sqrt(head_dim)
-    scale = np.float32(1.0 / np.sqrt(head_dim))
-    q_scaled = opset.multiply(q, opset.constant(scale, Type.f32))
+    # 3. Calculate attention
+    scale = opset.constant(np.float32(1.0 / np.sqrt(head_dim)))
     
-    # Compute attention scores
-    # [batch, num_heads, seq_len, seq_len]
-    scores = opset.matmul(q_scaled, k, transpose_a=False, transpose_b=True)
+    attention_output = opset.scaled_dot_product_attention(q, k_combined, v_combined, mask, scale)
     
-    # 4. Apply attention mask if provided
-    if mask is not None:
-        scores = opset.add(opset.convert(scores, Type.f32), opset.convert(mask, Type.f32), name="masked_scores")
-    
-    # 5. Apply softmax
-    attention_weights = opset.softmax(scores, axis=-1, name="attention_weights")
-    
-    # 6. Apply attention to values
-    # [batch, num_heads, seq_len, head_dim]
-    context = opset.matmul(attention_weights, v, transpose_a=False, transpose_b=False)
-    
-    # 7. Reshape output
+    # 4. Reshape output
     # Transpose back to [batch, seq_len, num_heads, head_dim]
-    context_transposed = opset.transpose(context, [0, 2, 1, 3])
+    context_transposed = opset.transpose(attention_output, [0, 2, 1, 3])
     
     # Combine heads: [batch, seq_len, hidden_dim]
     output = opset.reshape(context_transposed,
@@ -331,7 +435,7 @@ def save_tokenzier(orig_model_path, ov_model_path):
 
 
 
-def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, rope_const, beam_idx, batch_dim):
+def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, position_ids, rope_const, beam_idx, batch_dim):
     name_suffix = f".layer{layer_idx}"
     name_prefix = "model.layers.self_attn"
     # layerNorm operation
@@ -340,6 +444,9 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
     q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
     k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
     v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
+
+    if causal_mask is None:
+        causal_mask = create_causal_mask(attn_mask, k, input_layernorm)
 
     # custom op
     # attn_output = make_mha([q, k, v], kv_cache, beam_table, attn_mask, cos_tab, sin_tab,
@@ -350,7 +457,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
                         configs["head_size"],
                         batch_dim=batch_dim,
                         layer_idx=layer_idx,
-                        mask=attn_mask,
+                        mask=causal_mask,
                         position_ids=position_ids,
                         rope_const=rope_const,
                         beam_idx=beam_idx,
@@ -374,7 +481,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, position_ids, ro
     mlp_output = mlp(post_attention_layernorm)
     # residual connection.
     output = opset.add(attn_output, mlp_output, auto_broadcast="numpy", name=f"{name_prefix}.add1{name_suffix}")
-    return output, sinks
+    return output, sinks, causal_mask
 
 
 def init_rope(head_dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
@@ -408,8 +515,9 @@ def create_model(configs, consts):
                          opset.constant([0], dtype=np.int64))
 
     sinks = []
+    causal_mask = None
     for i in tqdm(range(configs["layer_num"])):
-        hidden_states, layer_sinks = layer(configs, consts, i, hidden_states, attention_mask, position_ids, rope_const, beam_idx, batch_size)
+        hidden_states, layer_sinks, causal_mask = layer(configs, consts, i, hidden_states, attention_mask, causal_mask, position_ids, rope_const, beam_idx, batch_size)
         sinks = sinks + layer_sinks
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
