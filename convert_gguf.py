@@ -238,7 +238,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, head_size, hidden_dim, cos_sin_cached, 
     q_rotated = opset.add(opset.multiply(q, cos_unsqueezed), opset.multiply(rotate_half(q, head_size, hidden_dim), sin_unsqueezed))
     k_rotated = opset.add(opset.multiply(k, cos_unsqueezed), opset.multiply(rotate_half(k, head_size, hidden_dim), sin_unsqueezed))
 
-    return q_rotated, k_rotated, (cos, sin)
+    return q_rotated, k_rotated, (cos_unsqueezed, sin_unsqueezed)
 
 
 def rope_emb(x, rope_const, position_ids, batch_dim):
@@ -321,14 +321,12 @@ def multi_head_attention(query, key, value,
     cos = None
     sin = None
     if cos_sin_cached is None:
-        sin, cos = rope_emb(v, rope_const, position_ids, batch_dim)
+        cos, sin = rope_emb(v, rope_const, position_ids, batch_dim)
     
-    # 2. Apply rotary embeddings if provided
-    if sin is not None and cos is not None:
-        #q, k = apply_rotary_embedding(q, k, sin, cos, hidden_dim, opset)
-        q, k, cos_sin_cached = apply_rotary_pos_emb(q, k, sin, cos, head_dim, hidden_dim, cos_sin_cached)
+    # 2. Apply rotary embeddings
+    q, k, cos_sin_cached = apply_rotary_pos_emb(q, k, cos, sin, head_dim, hidden_dim, cos_sin_cached)
 
-    default_key = opset.broadcast(opset.constant([0.0], dtype=np.float32),
+    default_key = opset.broadcast(opset.constant(0.0, dtype=np.float32),
                                 opset.concat([batch_dim,
                                             np.int64([num_heads]),
                                             np.int64([0]),
