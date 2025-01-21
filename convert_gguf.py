@@ -81,7 +81,7 @@ def create_attention_mask(input_shape, opset):
     return opset.constant(mask, Type.f32)
 
 
-def create_causal_mask(attention_mask, keys, hidden_state, hidden_dim, input_shape):
+def create_causal_mask(attention_mask, keys, hidden_dim, input_shape):
     # Extract shape of attention mask
     t130 = opset.shape_of(attention_mask, output_type=Type.i64)
     t131 = opset.constant(1, dtype=np.int64)
@@ -337,7 +337,7 @@ def multi_head_attention(query, key, value,
     k_cache_val = opset.read_value(default_key, 
                                    variable_shape=ov.PartialShape([-1,num_heads_kv,-1,head_dim]),
                                    variable_type=Type.f32,
-                                   variable_id=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
+                                   variable_id=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
     k_cache = opset.gather(k_cache_val, beam_idx, opset.constant(0, dtype=np.int64), batch_dims=0)
     default_value = opset.broadcast(opset.constant(0.0, dtype=np.float32),
                                 opset.concat([batch_dim,
@@ -348,14 +348,14 @@ def multi_head_attention(query, key, value,
     v_cache_val = opset.read_value(default_value, 
                                    variable_shape=ov.PartialShape([-1,num_heads_kv,-1,head_dim]),
                                    variable_type=Type.f32,
-                                   variable_id=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
+                                   variable_id=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
     v_cache = opset.gather(v_cache_val, beam_idx, opset.constant(0, dtype=np.int64), batch_dims=0)
 
     k_combined = opset.concat([k_cache, k], axis=2)
     v_combined = opset.concat([v_cache, v], axis=2)
 
-    k_assigned = opset.assign(k_combined, f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
-    v_assigned = opset.assign(v_combined, f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key", name=f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
+    k_assigned = opset.assign(k_combined, f"past_key_values.{layer_idx}.keypresent.{layer_idx}.key")
+    v_assigned = opset.assign(v_combined, f"past_key_values.{layer_idx}.valuepresent.{layer_idx}.key")
 
     if num_heads == num_heads_kv:
         k_reshaped = k_combined
@@ -385,9 +385,9 @@ def multi_head_attention(query, key, value,
         v_reshaped = opset.reshape(v_combined_broad, [0, num_heads, -1, head_dim], special_zero=True)
 
     # 3. Calculate attention
-    scale = opset.constant(np.float32(1.0 / np.sqrt(head_dim)))
+    #scale = opset.constant(np.float32(1.0 / np.sqrt(head_dim)))
     
-    attention_output = opset.scaled_dot_product_attention(q, k_reshaped, v_reshaped, mask, scale)
+    attention_output = opset.scaled_dot_product_attention(q, k_reshaped, v_reshaped, mask)
     
     # 4. Reshape output
     # Transpose back to [batch, seq_len, num_heads, head_dim]
@@ -430,15 +430,17 @@ def make_mvn(key, input, consts, configs, name_suffix=""):
     return mvn
 
 def make_rms_norm(key, input, consts, epsilon):
-    weights = opset.constant(consts[f"{key}.weight"].astype(np.float32), Type.f32)
-    epsilon_c = opset.constant(np.float32([[[epsilon]]]))
-    #pow = opset.multiply(input, input, name=f"{key}.pow{name_suffix}")
-    pow = opset.power(input, np.array([[[2]]], np.float32))
+    epsilon_c = opset.constant(np.float16([[[epsilon]]]))
+    pow = opset.power(input, opset.convert(np.array([[[2]]], np.float16), Type.f32))
     variance = opset.reduce_mean(pow, opset.constant([-1], dtype=np.int64), keep_dims=True)
-    add = opset.add(variance, epsilon_c)
+    add = opset.add(variance, opset.convert(epsilon_c, Type.f32))
     sqrt = opset.sqrt(add)
-    div = opset.divide(weights, sqrt)
+    div = opset.divide(opset.convert(opset.constant([[[1]]], dtype=np.float16), Type.f32), sqrt)
     mul = opset.multiply(div, input, auto_broadcast="numpy")
+    if not np.all(consts[f"{key}.weight"] == 1.0):
+        weights = opset.convert(opset.constant(consts[f"{key}.weight"].reshape((1, 1, -1)), np.float16), Type.f32)
+        mul = opset.multiply(mul, weights, auto_broadcast="numpy")
+
     return mul
 
 def make_embedding(key, input, consts):
@@ -482,7 +484,7 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                                     axis=0)
 
     if causal_mask is None:
-        causal_mask = create_causal_mask(attn_mask, k, input_layernorm, hidden_dim, input_shape)
+        causal_mask = create_causal_mask(attn_mask, k, hidden_dim, input_shape)
 
     attn_output, sinks, cos_sin_cached = multi_head_attention(q, k, v,
                         configs,
@@ -560,7 +562,7 @@ def create_model(configs, consts):
     # embed_out
     embed_out = make_fc("lm_head", final_layernorm, consts)
 
-    logits = opset.result(opset.convert(embed_out, Type.f32), name="logits")
+    logits = opset.result(embed_out, name="logits")
     logits.set_friendly_name("logits")
     cost = time.time() - beg
     print(f"generate ov model done, cost {cost:.2f} seconds.")
