@@ -406,6 +406,7 @@ def multi_head_attention(query, key, value,
     return output, [k_assigned, v_assigned], cos_sin_cached, mask
 #=========================================================================
 
+
 def make_fc(key, input, consts, name_suffix=""):
     # weight const f32 NxK
     weight = consts[f"{key}.weight"]
@@ -423,6 +424,18 @@ def make_fc(key, input, consts, name_suffix=""):
         matmul = opset.add(matmul, bias, auto_broadcast="numpy")
 
     return matmul
+
+
+def make_lm_head(key, input, consts, embeddings_node):
+    if consts.get(f"{key}.weight", None) is not None:
+        weight = consts[f"{key}.weight"]
+        weights = opset.constant(weight, dtype=np.float16)
+        weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
+        w_f32 = opset.convert(weights, Type.f32)
+    else:
+        w_f32 = embeddings_node # shared weights with embeddings
+    return opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
+
 
 def make_mvn(key, input, consts, configs, name_suffix=""):
     mvn = opset.mvn(input, axes=[-1], normalize_variance=True, eps=configs["layer_norm_eps"], eps_mode="inside_sqrt", name=f"{key}.mvn{name_suffix}")
@@ -454,7 +467,7 @@ def make_embedding(key, input, consts):
     embed_f32.set_friendly_name(name=key)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
-    return inputs_embeds
+    return inputs_embeds, embed_f32
 
 def save_tokenzier(orig_model_path, ov_model_path):
     tokenizer = AutoTokenizer.from_pretrained(orig_model_path)
@@ -543,7 +556,7 @@ def create_model(configs, consts):
     # [batch, max_kv_len]
     beam_idx = opset.parameter([-1], Type.i32, name="beam_idx")
 
-    inputs_embeds = make_embedding("model.embed_tokens.weight", input_ids, consts)
+    inputs_embeds, embeddings = make_embedding("model.embed_tokens.weight", input_ids, consts)
     hidden_states = inputs_embeds
 
     rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"])
@@ -565,7 +578,7 @@ def create_model(configs, consts):
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
     # embed_out
-    embed_out = make_fc("lm_head", final_layernorm, consts)
+    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings)
 
     logits = opset.result(embed_out, name="logits")
     logits.set_friendly_name("logits")
@@ -608,7 +621,7 @@ def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[st
     consts = {
         "model.embed_tokens.weight": np.array(weights["token_embd.weight"]),
         "model.norm.weight": np.array(weights["output_norm.weight"]),
-        "lm_head.weight": np.array(weights[lm_head_weights_name]) if lm_head_weights_name is not None else np.array(weights["token_embd.weight"]),
+        "lm_head.weight": np.array(weights[lm_head_weights_name]) if lm_head_weights_name is not None else None,
         "lm_head.bias": None,  # GGUF models typically don"t have this bias
         "layers": []
     }
