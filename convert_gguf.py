@@ -430,7 +430,7 @@ def make_lm_head(key, input, consts, embeddings_node):
     if consts.get(f"{key}.weight", None) is not None:
         weight = consts[f"{key}.weight"]
         weights = opset.constant(weight, dtype=np.float16)
-        weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
+        weights.set_friendly_name(name=f"{key}.weight")
         w_f32 = opset.convert(weights, Type.f32)
     else:
         w_f32 = embeddings_node # shared weights with embeddings
@@ -587,6 +587,11 @@ def create_model(configs, consts):
     model = Model([logits], sinks,
                  [input_ids, attention_mask, position_ids, beam_idx])
     model.outputs[0].get_tensor().set_names({"logits"})
+
+    # set runtime options
+    model.set_rt_info("f16", ["runtime_options", "KV_CACHE_PRECISION"])
+    model.set_rt_info("8.0", ["runtime_options", "ACTIVATIONS_SCALE_FACTOR"])
+
     return model
 
 
@@ -621,7 +626,7 @@ def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[st
     consts = {
         "model.embed_tokens.weight": np.array(weights["token_embd.weight"]),
         "model.norm.weight": np.array(weights["output_norm.weight"]),
-        "lm_head.weight": np.array(weights[lm_head_weights_name]) if lm_head_weights_name is not None else None,
+        "lm_head.weight": np.array(weights["output.weight"]) if weights.get("output.weight", None) is not None else None,
         "lm_head.bias": None,  # GGUF models typically don"t have this bias
         "layers": []
     }
@@ -661,19 +666,9 @@ if __name__ == "__main__":
     parser.add_argument("--org_model_path", type=str, default="Model ID (can be a Hugginface Hub id, or a local directory)")
     parser.add_argument("--ov_model_path", type=str, nargs="?", default="./gen/llama-2-7b-chat/")
     parser.add_argument("--lm_head_name", type=str, nargs="?", default=None)
-    parser.add_argument("--compressed_weight", type=bool, nargs="?", default=False)
-    parser.add_argument("--quant_type", type=str, nargs="?", default="")
+    parser.add_argument("--model_id", type=str, nargs="?", default=None)
     args = parser.parse_args()
-    # for compatible, will remove
-    if args.compressed_weight:
-        print(f"warning: please use '--quant=nncf_w8' instead.")
-        if args.quant_type:
-            raise ValueError("compressed_weight and quant_type can not be set at the same time.")
-        args.quant_type = "nncf_w8"
-    configs["quant_type"] = args.quant_type
 
-    if args.quant_type:
-        args.ov_model_path = os.path.join(args.ov_model_path, args.quant_type)
     os.makedirs(args.ov_model_path, exist_ok=True)
 
     model_configs, consts = load_gguf_model(args.org_model_path, args.lm_head_name)
@@ -686,7 +681,7 @@ if __name__ == "__main__":
     print(f"serialize done, cost {cost:.2f} seconds.")
     print(f"save tokenzier to '{args.ov_model_path}' ...")
     # save tokenizer and config to load with GenAI and Optimum
-    model_id = "HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
+    model_id = args.model_id #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
     save_tokenzier(model_id, args.ov_model_path)
     config = AutoConfig.from_pretrained(model_id)
     config.save_pretrained(args.ov_model_path)
