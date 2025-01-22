@@ -94,7 +94,7 @@ def create_causal_mask(attention_mask, keys, hidden_dim, input_shape):
     t40 = input_shape
     t127 = opset.gather(t40, opset.constant(1, dtype=np.int64), axis=0)
     t129 = opset.reshape(t127, opset.constant([1], dtype=np.int64), special_zero=False) 
-    t136 = opset.concat([t129, t135], axis=0, name="ListConstruct")
+    t136 = opset.concat([t129, t135], axis=0)
     min_shape_val = opset.constant([1, 1], dtype=np.int64)
     t137 = opset.maximum(min_shape_val, t136, auto_broadcast="numpy")
     t138 = opset.broadcast(opset.constant(-65504, dtype=np.float32), t137, broadcast_spec="NUMPY")
@@ -126,8 +126,8 @@ def create_causal_mask(attention_mask, keys, hidden_dim, input_shape):
     t155 = opset.select(t153, t138, t154, auto_broadcast="numpy")
     
     # Next branch
+    t156 = opset.constant(0, dtype=np.int32)
     t157 = opset.constant(1, dtype=np.int32)
-    t156 = opset.constant(0, dtype=np.int64)
     t158 = opset.range(t156, t133, t157, output_type=Type.f32)
     t159 = opset.convert(t158, destination_type=np.int64)
     t160 = opset.convert(t159, destination_type=np.float32)
@@ -172,7 +172,7 @@ def create_causal_mask(attention_mask, keys, hidden_dim, input_shape):
     t194 = opset.constant([0], dtype=np.int64)
     t195 = opset.constant([1], dtype=np.int64)
     t196 = opset.slice(t180, t194, t135, t195, hidden_dim)
-    #------- Verified ---------#
+
     t197 = opset.unsqueeze(attention_mask, t48)
     t198 = opset.constant(2, dtype=np.int64)
     t199 = opset.unsqueeze(t197, t198)
@@ -283,7 +283,9 @@ def multi_head_attention(query, key, value,
                         batch_dim,
                         layer_idx,
                         hidden_dim,
+                        input_shape,
                         output_shape,
+                        attention_mask,
                         mask=None,
                         position_ids=None,
                         rope_const=None,
@@ -384,6 +386,9 @@ def multi_head_attention(query, key, value,
                                             broadcast_spec="BIDIRECTIONAL")
         v_reshaped = opset.reshape(v_combined_broad, [0, num_heads, -1, head_dim], special_zero=True)
 
+    if mask is None:
+        mask = create_causal_mask(attention_mask, k_cache, hidden_dim, input_shape)
+
     # 3. Calculate attention
     #scale = opset.constant(np.float32(1.0 / np.sqrt(head_dim)))
     
@@ -398,7 +403,7 @@ def multi_head_attention(query, key, value,
                           output_shape,
                           special_zero=False)
     
-    return output, [k_assigned, v_assigned], cos_sin_cached
+    return output, [k_assigned, v_assigned], cos_sin_cached, mask
 #=========================================================================
 
 def make_fc(key, input, consts, name_suffix=""):
@@ -483,15 +488,15 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                                     opset.constant([-1], dtype=np.int64)],
                                     axis=0)
 
-    if causal_mask is None:
-        causal_mask = create_causal_mask(attn_mask, k, hidden_dim, input_shape)
 
-    attn_output, sinks, cos_sin_cached = multi_head_attention(q, k, v,
+    attn_output, sinks, cos_sin_cached, causal_mask = multi_head_attention(q, k, v,
                         configs,
                         batch_dim=batch_dim,
                         layer_idx=layer_idx,
                         hidden_dim=hidden_dim,
+                        input_shape=input_shape,
                         output_shape=output_shape,
+                        attention_mask=attn_mask,
                         mask=causal_mask,
                         position_ids=position_ids,
                         rope_const=rope_const,
