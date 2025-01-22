@@ -362,15 +362,29 @@ def multi_head_attention(query, key, value,
                           special_zero=False)
     
     return output, [k_assigned, v_assigned], cos_sin_cached, mask
-#=========================================================================
 
 
-def make_fc(key, input, consts, name_suffix=""):
+# Reorder weight rows from 0,2,1,3 -> 0,1,2,3 for each head
+def reorder_interleaved_format(weights, head_size):
+    shape = weights.shape
+    num_heads = shape[0] // head_size
+    weights = weights.reshape((num_heads, head_size, -1))
+    weights = np.moveaxis(weights, 0, 1)
+    new_weight = np.empty_like(weights)
+    new_weight[0:head_size // 2] = weights[0::2]
+    new_weight[(head_size//2):head_size] = weights[1::2]
+    new_weight = np.moveaxis(new_weight, 0, 1)
+    return new_weight.reshape(shape)
+
+
+def make_fc(key, input, consts, reorder=False, head_size=-1):
     # weight const f32 NxK
     weight = consts[f"{key}.weight"]
+    if reorder:
+        weight = reorder_interleaved_format(weight, head_size)
 
     weights = opset.constant(weight, dtype=np.float16)
-    weights.set_friendly_name(name=f"{key}.weight{name_suffix}")
+    weights.set_friendly_name(name=f"{key}.weight")
     w_f32 = opset.convert(weights, Type.f32)
 
     matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
@@ -378,7 +392,7 @@ def make_fc(key, input, consts, name_suffix=""):
     # add bias
     if consts[f"{key}.bias"] is not None:
         bias = opset.constant(consts[f"{key}.bias"], dtype=np.float16)
-        bias.set_friendly_name(name=f"{key}.bias{name_suffix}")
+        bias.set_friendly_name(name=f"{key}.bias")
         matmul = opset.add(matmul, bias, auto_broadcast="numpy")
 
     return matmul
@@ -446,9 +460,9 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     # layerNorm operation
     input_layernorm = make_rms_norm("model.layers.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
-    q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
-    k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
-    v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], name_suffix)
+    q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], True, configs["head_size"])
+    k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], True, configs["head_size"])
+    v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx])
 
     input_shape = opset.shape_of(input_layernorm)
     if output_shape is None:
@@ -474,18 +488,18 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                         beam_idx=beam_idx,
                         cos_sin_cached=cos_sin_cached)
 
-    attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx], name_suffix)
+    attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx])
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
     post_attention_layernorm = make_rms_norm("model.layers.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
-        gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx], name_suffix)
+        gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx])
         silu = opset.swish(gate_proj)
-        up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx], name_suffix)
+        up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx])
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
-        down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx], name_suffix)
+        down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx])
         return down_proj
 
     mlp_output = mlp(post_attention_layernorm)
