@@ -39,47 +39,6 @@ def show_model(m):
     for port, _output in enumerate(m.outputs):
         print("	[{}] {}".format(port, _output))
 
-def make_mha(qkvs, kv_cache, beam_table, attn_mask, cos_tab, sin_tab,
-             layer_idx, rotary_dim, n_hidden, n_head, name, num_kv_heads=0, rope_type="modified", multi_query_is_planar=False):
-    qkvs_len = len(qkvs)
-    mha_attr = {"arg_kv_cache": qkvs_len,
-                "arg_beam_table": qkvs_len + 1,
-                "arg_attn_mask": qkvs_len + 2,
-                "arg_cos": qkvs_len + 3,
-                "arg_sin": qkvs_len + 4,
-                "layer_id": layer_idx,
-                "rotary_dims": rotary_dim,
-                "n_hidden": n_hidden,
-                "n_head": n_head,
-                "num_kv_heads": num_kv_heads,
-                "multi_query_is_planar": multi_query_is_planar,
-                "rope_type": ["original", "modified"].index(rope_type)}
-
-    if qkvs_len == 1:
-        mha_attr["arg_q"] = 0
-        mha_attr["arg_k"] = 0
-        mha_attr["arg_v"] = 0
-    else:
-        mha_attr["arg_q"] = 0
-        mha_attr["arg_k"] = 1
-        mha_attr["arg_v"] = 2
-
-    output = custom_opset.create("MultiHeadAttention", 
-        [*qkvs, kv_cache, beam_table, attn_mask, cos_tab, sin_tab], mha_attr)
-    output.set_friendly_name(name)
-    return output
-
-
-#=========================================================================
-def create_attention_mask(input_shape, opset):
-    """Create causal attention mask"""
-    seq_len = input_shape[1]
-    # Create a matrix of shape [seq_len, seq_len] filled with ones in upper triangle
-    mask = np.triu(np.ones((seq_len, seq_len)), k=1)
-    # Convert to float32 and negate to get proper attention mask (0 for attend, -inf for mask)
-    mask = -65504 * mask
-    return opset.constant(mask, Type.f32)
-
 
 def create_causal_mask(attention_mask, keys, hidden_dim, input_shape):
     # Extract shape of attention mask
@@ -266,7 +225,7 @@ def rope_emb(x, rope_const, position_ids, batch_dim):
                                         broadcast_spec="BIDIRECTIONAL")
     # Compute frequencies
     freqs = opset.matmul(inv_freq_expanded, position_ids_expanded, transpose_a=False, transpose_b=False)  # Shape: [batch_size, seq_len, head_dim]
-    freqs_transposed = opset.transpose(freqs, [0, 2, 1])  # Transpose to shape: [batch_size, head_dim, seq_len]
+    freqs_transposed = opset.transpose(freqs, np.int32([0, 2, 1]))  # Transpose to shape: [batch_size, head_dim, seq_len]
 
     # Concatenate frequencies along the last dimension
     emb = opset.concat([freqs_transposed, freqs_transposed], axis=-1)  # Shape: [batch_size, head_dim, seq_len * 2]
@@ -308,7 +267,6 @@ def multi_head_attention(query, key, value,
     num_heads = configs["head_num"]
     head_dim = configs["head_size"]
     num_heads_kv = configs["head_num_kv"]
-    hidden_size = num_heads * head_dim
     
     # 1. Reshape Q, K, V to split heads
     def split_heads(x, num_heads, head_dim):
