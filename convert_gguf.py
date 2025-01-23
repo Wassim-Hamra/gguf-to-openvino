@@ -20,17 +20,11 @@ import openvino as ov
 
 OV_XML_FILE_NAME="openvino_model.xml"
 
-ext_path = None
+class QTYPE(Enum):
+    FP16 = 1
+    INT8 = 2
+    INT4 = 3
 
-custom_opset = opset_utils._get_node_factory()
-
-configs = {
-    "quant_type": ""#"nncf_w8",        # valid: "", "nncf_w8", "llama_w8_0",
-}
-
-def pt_as_np(t):
-    if t is not None: return t.detach().numpy().astype(np.float32)
-    return None
 
 def show_model(m):
     print("inputs of the model:")
@@ -566,12 +560,6 @@ def create_model(configs, consts):
     model.set_rt_info("8.0", ["runtime_options", "ACTIVATIONS_SCALE_FACTOR"])
 
     return model
-
-
-class QTYPE(Enum):
-    FP16 = 1
-    INT8 = 2
-    INT4 = 3
 
 
 def get_quantizaiton_type(gguf_type):
