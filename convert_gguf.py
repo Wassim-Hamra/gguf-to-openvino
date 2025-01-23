@@ -18,7 +18,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 OV_XML_FILE_NAME="openvino_model.xml"
 
-class QTYPE(Enum):
+class QType(Enum):
     FP16 = 1
     INT8 = 2
     INT4 = 3
@@ -370,8 +370,7 @@ def reorder_interleaved_format(weights, head_size):
     return new_weight.reshape(shape)
 
 
-def make_fc(key, input, consts, reorder=False, head_size=-1):
-    # weight const f32 NxK
+def make_fp16_weights(key, consts, reorder, head_size):
     weight = consts[f"{key}.weight"]
     if reorder:
         weight = reorder_interleaved_format(weight, head_size)
@@ -379,24 +378,54 @@ def make_fc(key, input, consts, reorder=False, head_size=-1):
     weights = opset.constant(weight, dtype=np.float16)
     weights.set_friendly_name(name=f"{key}.weight")
     w_f32 = opset.convert(weights, Type.f32)
+    return w_f32
 
+def make_int8_weights(key, consts, reorder, head_size):
+    weight = consts[f"{key}.weight"]
+    scale = consts[f"{key}.scales"]
+    bias = consts[f"{key}.biases"]
+    if reorder:
+        weight = reorder_interleaved_format(weight, head_size)
+        scales = reorder_interleaved_format(scales, head_size)
+        biases = reorder_interleaved_format(biases, head_size)
+
+    weight = weight.view(np.uint8)
+    weights = opset.constant(weight, dtype=np.uint8)
+    weights.set_friendly_name(name=f"{key}.weight")
+    weights_f16 = opset.convert(weights, Type.f16)
+
+    zero_point = (-bias / scale).astype(np.uint8)
+    zero_points = opset.constant(zero_point, dtype=np.uint8)
+    zero_points_f16 = opset.convert(zero_points, Type.f16)
+
+    scales = opset.constant(scale, dtype=np.float16)
+
+    w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
+    w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
+    w_zp_s_f32 = opset.convert(w_zp_s, Type.f32)
+    return w_zp_s_f32
+
+def make_weights_subgraph(key, consts, qtype, reorder, head_size):
+    if qtype == QType.FP16:
+        final_node = make_fp16_weights(key, consts, reorder, head_size)
+    elif qtype == QType.INT8:
+        final_node = make_int8_weights(key, consts, reorder, head_size)
+    else:
+        raise ValueError("Unsupported quantization type:")
+    
+    return final_node
+
+
+def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
+    # weight const f32 NxK
+    w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size)
     matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
-
-    # add bias
-    if consts[f"{key}.bias"] is not None:
-        bias = opset.constant(consts[f"{key}.bias"], dtype=np.float16)
-        bias.set_friendly_name(name=f"{key}.bias")
-        matmul = opset.add(matmul, bias, auto_broadcast="numpy")
-
     return matmul
 
 
-def make_lm_head(key, input, consts, embeddings_node):
+def make_lm_head(key, input, consts, embeddings_node, qtype):
     if consts.get(f"{key}.weight", None) is not None:
-        weight = consts[f"{key}.weight"]
-        weights = opset.constant(weight, dtype=np.float16)
-        weights.set_friendly_name(name=f"{key}.weight")
-        w_f32 = opset.convert(weights, Type.f32)
+        w_f32 = make_weights_subgraph(key, consts, qtype, False, -1)
     else:
         w_f32 = embeddings_node # shared weights with embeddings
     return opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
@@ -428,10 +457,8 @@ def make_rms_norm(key, input, consts, epsilon):
     return mul
 
 
-def make_embedding(key, input, consts):
-    embed_in_const = Constant(consts[key], True)
-    embed_f32 = opset.convert(embed_in_const, Type.f32)
-    embed_f32.set_friendly_name(name=key)
+def make_embedding(key, input, consts, qtype):
+    embed_f32 = make_weights_subgraph(key, consts, qtype, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
     return inputs_embeds, embed_f32
@@ -456,9 +483,9 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     # layerNorm operation
     input_layernorm = make_rms_norm("model.layers.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
-    q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], True, configs["head_size"])
-    k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], True, configs["head_size"])
-    v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx])
+    q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"])
+    k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"])
+    v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"])
 
     input_shape = opset.shape_of(input_layernorm)
     if output_shape is None:
@@ -484,18 +511,18 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                         beam_idx=beam_idx,
                         cos_sin_cached=cos_sin_cached)
 
-    attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx])
+    attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx], configs["qtype"])
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
     post_attention_layernorm = make_rms_norm("model.layers.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
-        gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx])
+        gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx], configs["qtype"])
         silu = opset.swish(gate_proj)
-        up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx])
+        up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx], configs["qtype"])
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
-        down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx])
+        down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx], configs["qtype"])
         return down_proj
 
     mlp_output = mlp(post_attention_layernorm)
@@ -524,7 +551,7 @@ def create_model(configs, consts):
     # [batch, max_kv_len]
     beam_idx = opset.parameter([-1], Type.i32, name="beam_idx")
 
-    inputs_embeds, embeddings = make_embedding("model.embed_tokens.weight", input_ids, consts)
+    inputs_embeds, embeddings = make_embedding("model.embed_tokens", input_ids, consts, configs["qtype"])
     hidden_states = inputs_embeds
 
     rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"], configs["rope_freq_base"])
@@ -546,7 +573,7 @@ def create_model(configs, consts):
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
     # embed_out
-    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings)
+    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, configs["qtype"])
 
     logits = opset.result(embed_out, name="logits")
     logits.set_friendly_name("logits")
@@ -565,16 +592,16 @@ def create_model(configs, consts):
 
 def get_quantizaiton_type(gguf_type):
     if gguf_type == 0 or gguf_type == 1:
-        qtype = QTYPE.FP16
+        qtype = QType.FP16
         print("Working with FP16 model")
     elif gguf_type == 2 or gguf_type == 3:
         # MOSTLY_Q4_0 or MOSTLY_Q4_1
-        qtype = QTYPE.INT4
+        qtype = QType.INT4
         # print bits value
         print("Working with INT4 quantized model")
     elif gguf_type == 7:
         # MOSTLY_Q8_0 = 7
-        qtype = QTYPE.INT8
+        qtype = QType.INT8
         print("Working with INT8 quantized model")
     else:
         qtype = None
@@ -626,6 +653,15 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "lm_head.bias": None,  # GGUF models typically don"t have this bias
         "layers": []
     }
+
+    # w = np.array(weights["blk.29.ffn_gate.weight"])
+    # s = np.array(weights["blk.29.ffn_gate.scales"])
+    # b = np.array(weights["blk.29.ffn_gate.biases"])
+
+    # print("blk.29.ffn_gate.weight:", w.shape)
+    # print("blk.29.ffn_gate.scales:", s.shape)
+    # print("blk.29.ffn_gate.biases:", b.shape)
+    # print("blk.29.ffn_gate.weight:", w.dtype)
     
     # Extract layer weights
     print("Extract layer weights")
@@ -669,6 +705,7 @@ if __name__ == "__main__":
     config, consts = load_gguf_model(args.org_model_path)
     model = create_model(config, consts)
     show_model(model)
+
     print(f"serialize ov model to '{args.ov_model_path}'...")
     beg = time.time()
     serialize(model, os.path.join(args.ov_model_path, OV_XML_FILE_NAME))
