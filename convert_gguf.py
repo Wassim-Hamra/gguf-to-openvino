@@ -531,7 +531,7 @@ def create_model(configs, consts):
     inputs_embeds, embeddings = make_embedding("model.embed_tokens.weight", input_ids, consts)
     hidden_states = inputs_embeds
 
-    rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"])
+    rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"], configs["rope_freq_base"])
 
     input_shape = opset.shape_of(input_ids)
     batch_size = opset.gather(input_shape,
@@ -586,6 +586,7 @@ def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[st
         "max_position_embeddings": metadata.get("llama.context_length", np.int32([2048])).item(),
         "rotary_dims": metadata["llama.rope.dimension_count"].item(),
         "rms_norm_eps": metadata["llama.attention.layer_norm_rms_epsilon"].item(),
+        "rope_freq_base": metadata.get("llama.rope.freq_base", np.float32(10000)).item(),
     }
 
     print("config: ", config)
