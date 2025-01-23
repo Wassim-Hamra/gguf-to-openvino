@@ -614,7 +614,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
 
     print("Config:\n", config)
 
-    print("general.basename: ", metadata["general.basename"], ", general.ur:", metadata["general.url"], ", general.source.url:", metadata["general.source.url"])
+    #print("general.basename: ", metadata["general.basename"], ", general.ur:", metadata["general.url"], ", general.source.url:", metadata["general.source.url"])
 
     # Extract weights and biases
     print("Extract weights and biases")
@@ -683,3 +683,5 @@ if __name__ == "__main__":
         save_tokenzier(model_id, args.ov_model_path)
         config = AutoConfig.from_pretrained(model_id)
         config.save_pretrained(args.ov_model_path)
+    else:
+        print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
