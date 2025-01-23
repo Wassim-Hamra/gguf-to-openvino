@@ -4,10 +4,10 @@ An example that reads GGUF and creates OpenVINO on the fly.
 ## Usage
 1. Download GGUF file:
 ```sh
-huggingface-cli download "atwine/Llama-2-7b-chat-f16-gguf" "Llama-2-7b-chat-f16.gguf"
+huggingface-cli download mradermacher/SmolLM2-135M-GGUF SmolLM2-135M.f16.gguf --local-dir models
 ```
 
 2. Convert the model:
 ```sh
-python convert_gguf.py --org_model_path /home/<user_name>/.cache/huggingface/hub/models--atwine--Llama-2-7b-chat-f16-gguf/snapshots/140c851f3a1f5b9503a2c5d231122d02a0ae6c3c/Llama-2-7b-chat-f16.gguf
+python convert_gguf.py --org_model_path models/SmolLM2-135M.f16.gguf --ov_model_path models/smollm_ov
 ```
