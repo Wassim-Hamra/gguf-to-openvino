@@ -581,7 +581,7 @@ def get_quantizaiton_type(gguf_type):
     return qtype
 
 
-def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Extract configurations and weights from GGUF model"""
     print(f"extracting from GGUF model '{model_path}'...")
     beg = time.time()
@@ -590,6 +590,13 @@ def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[st
     weights, metadata = mx.load(model_path, return_metadata=True)
 
     print("Metadata:\n", metadata.keys())
+
+    try:
+        url_parts = metadata["general.source.url"].split("/")
+        model_id = f"{url_parts[-2]}/{url_parts[-1]}"
+    except:
+        print("Cannot get model_id to get the config.json and tokenizer")
+        model_id = None
 
     config = {
         "layer_num": metadata["llama.block_count"].item(),
@@ -602,9 +609,12 @@ def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[st
         "rms_norm_eps": metadata["llama.attention.layer_norm_rms_epsilon"].item(),
         "rope_freq_base": metadata.get("llama.rope.freq_base", np.float32(10000)).item(),
         "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
+        "model_id": model_id,        
     }
 
     print("Config:\n", config)
+
+    print("general.basename: ", metadata["general.basename"], ", general.ur:", metadata["general.url"], ", general.source.url:", metadata["general.source.url"])
 
     # Extract weights and biases
     print("Extract weights and biases")
@@ -652,23 +662,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("")
     parser.add_argument("--org_model_path", type=str, default="Model ID (can be a Hugginface Hub id, or a local directory)")
     parser.add_argument("--ov_model_path", type=str, nargs="?", default="./gen/llama-2-7b-chat/")
-    parser.add_argument("--lm_head_name", type=str, nargs="?", default=None)
     parser.add_argument("--model_id", type=str, nargs="?", default=None)
     args = parser.parse_args()
 
     os.makedirs(args.ov_model_path, exist_ok=True)
 
-    model_configs, consts = load_gguf_model(args.org_model_path, args.lm_head_name)
-    model = create_model(model_configs, consts)
+    config, consts = load_gguf_model(args.org_model_path)
+    model = create_model(config, consts)
     show_model(model)
     print(f"serialize ov model to '{args.ov_model_path}'...")
     beg = time.time()
     serialize(model, os.path.join(args.ov_model_path, OV_XML_FILE_NAME))
     cost = time.time() - beg
     print(f"serialize done, cost {cost:.2f} seconds.")
-    print(f"save tokenzier to '{args.ov_model_path}' ...")
+
     # save tokenizer and config to load with GenAI and Optimum
-    model_id = args.model_id #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
-    save_tokenzier(model_id, args.ov_model_path)
-    config = AutoConfig.from_pretrained(model_id)
-    config.save_pretrained(args.ov_model_path)
+    model_id = args.model_id or config["model_id"] #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
+    if model_id:
+        print(f"save tokenzier to '{args.ov_model_path}' ...")
+        save_tokenzier(model_id, args.ov_model_path)
+        config = AutoConfig.from_pretrained(model_id)
+        config.save_pretrained(args.ov_model_path)
