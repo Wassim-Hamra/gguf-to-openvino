@@ -4,6 +4,7 @@ import numpy as np
 import sys, os
 import argparse
 import time
+from enum import Enum
 from tqdm import tqdm
 from typing import Dict, Any
 from pathlib import Path
@@ -567,6 +568,31 @@ def create_model(configs, consts):
     return model
 
 
+class QTYPE(Enum):
+    FP16 = 1
+    INT8 = 2
+    INT4 = 3
+
+
+def get_quantizaiton_type(gguf_type):
+    if gguf_type == 0 or gguf_type == 1:
+        qtype = QTYPE.FP16
+        print("Working with FP16 model")
+    elif gguf_type == 2 or gguf_type == 3:
+        # MOSTLY_Q4_0 or MOSTLY_Q4_1
+        qtype = QTYPE.INT4
+        # print bits value
+        print("Working with INT4 quantized model")
+    elif gguf_type == 7:
+        # MOSTLY_Q8_0 = 7
+        qtype = QTYPE.INT8
+        print("Working with INT8 quantized model")
+    else:
+        qtype = None
+        raise ValueError("Using unsupported GGUF quantization")
+    return qtype
+
+
 def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Extract configurations and weights from GGUF model"""
     print(f"extracting from GGUF model '{model_path}'...")
@@ -575,7 +601,7 @@ def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[st
     # Load GGUF model
     weights, metadata = mx.load(model_path, return_metadata=True)
 
-    print(metadata.keys())
+    print("Metadata:\n", metadata.keys())
 
     config = {
         "layer_num": metadata["llama.block_count"].item(),
@@ -587,13 +613,13 @@ def load_gguf_model(model_path: str, lm_head_weights_name: str) -> tuple[Dict[st
         "rotary_dims": metadata["llama.rope.dimension_count"].item(),
         "rms_norm_eps": metadata["llama.attention.layer_norm_rms_epsilon"].item(),
         "rope_freq_base": metadata.get("llama.rope.freq_base", np.float32(10000)).item(),
+        "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
     }
 
-    print("config: ", config)
+    print("Config:\n", config)
 
     # Extract weights and biases
     print("Extract weights and biases")
-    print('weights["token_embd.weight"]: ', type(weights["token_embd.weight"]))
     print("============= Weight keys ============")
     print(list(weights.keys()))
     consts = {
