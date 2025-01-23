@@ -315,7 +315,7 @@ def multi_head_attention(query, key, value,
     if num_heads == num_heads_kv:
         k_reshaped = k_combined
         v_reshaped = v_combined
-    else:
+    else: # Group Query Attention branch
         kv_per_head = num_heads // num_heads_kv
         k_combined_unsq = opset.unsqueeze(k_combined, opset.constant(2, dtype=np.int64))
         k_combined_broad = opset.broadcast(k_combined_unsq,
@@ -414,6 +414,7 @@ def make_mvn(key, input, consts, configs, name_suffix=""):
         mvn = opset.add(mvn, bias, auto_broadcast="numpy", name=f"{key}.add{name_suffix}")
     return mvn
 
+
 def make_rms_norm(key, input, consts, epsilon):
     epsilon_c = opset.constant(np.float16([[[epsilon]]]))
     pow = opset.power(input, opset.convert(np.array([[[2]]], np.float16), Type.f32))
@@ -428,6 +429,7 @@ def make_rms_norm(key, input, consts, epsilon):
 
     return mul
 
+
 def make_embedding(key, input, consts):
     embed_in_const = Constant(consts[key], True)
     embed_f32 = opset.convert(embed_in_const, Type.f32)
@@ -435,6 +437,7 @@ def make_embedding(key, input, consts):
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
     return inputs_embeds, embed_f32
+
 
 def save_tokenzier(orig_model_path, ov_model_path):
     tokenizer = AutoTokenizer.from_pretrained(orig_model_path)
@@ -613,8 +616,6 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     }
 
     print("Config:\n", config)
-
-    #print("general.basename: ", metadata["general.basename"], ", general.ur:", metadata["general.url"], ", general.source.url:", metadata["general.source.url"])
 
     # Extract weights and biases
     print("Extract weights and biases")
