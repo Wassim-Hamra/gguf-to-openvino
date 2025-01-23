@@ -1,22 +1,20 @@
-from openvino.runtime import Core, Model, Tensor, PartialShape, Type, serialize, opset_utils
-from openvino.runtime import opset15 as opset
-import numpy as np
-import sys, os
 import argparse
+import os
 import time
 from enum import Enum
-from tqdm import tqdm
-from typing import Dict, Any
 from pathlib import Path
+from typing import Any, Dict
 
-from transformers import AutoTokenizer, AutoConfig
-from openvino.runtime.op import Constant
-import numpy as np
-import os
-import sys
-import torch
 import mlx.core as mx
+import numpy as np
 import openvino as ov
+import torch
+from openvino.runtime import Model, Type
+from openvino.runtime import opset15 as opset
+from openvino.runtime import serialize
+from openvino.runtime.op import Constant
+from tqdm import tqdm
+from transformers import AutoConfig, AutoTokenizer
 
 OV_XML_FILE_NAME="openvino_model.xml"
 
@@ -515,7 +513,7 @@ def init_rope(head_dim, max_position_embeddings=2048, base=10000, device=None, s
 
 
 def create_model(configs, consts):
-    print(f"start generate ov model...")
+    print("start generate ov model...")
     beg = time.time()
     # [batch, query_len]
     input_ids = opset.parameter([-1, -1], Type.i64, name="input_ids")
@@ -597,7 +595,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     try:
         url_parts = metadata["general.source.url"].split("/")
         model_id = f"{url_parts[-2]}/{url_parts[-1]}"
-    except:
+    except Exception:
         print("Cannot get model_id to get the config.json and tokenizer")
         model_id = None
 
