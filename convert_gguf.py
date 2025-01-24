@@ -382,7 +382,8 @@ def make_fp16_weights(key, consts, reorder, head_size):
     w_f32 = opset.convert(weights, Type.f32)
     return w_f32
 
-def make_int8_weights(key, consts, reorder, head_size):
+
+def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
     weight = consts[f"{key}.weight"]
     weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
@@ -411,11 +412,51 @@ def make_int8_weights(key, consts, reorder, head_size):
     w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
     return w_zp_s_f32
 
+
+def make_int4_weights(key, consts, reorder, head_size):#
+    weight = consts[f"{key}.weight"]
+    weight = weight.view(np.uint8)
+    orig_weight_shape = list(weight.shape)
+    orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
+    weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
+    scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
+    bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
+
+    if reorder:
+        weight = reorder_interleaved_format(weight, head_size)
+        scale = reorder_interleaved_format(scale, head_size)
+        bias = reorder_interleaved_format(bias, head_size)
+
+    shape = weight.shape
+    weight_tensor = ov.Tensor(weight, (shape[0], shape[1]*2, shape[2]), Type.u4)
+    weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=True)
+    weights_f16 = opset.convert(weights, Type.f16)
+
+    zero_point = (-bias / scale).astype(np.uint8)
+    # Pack zero points: two subsequent values into one
+    mask = np.array(0b1111, dtype=np.uint8)
+    zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
+    zero_point_tensor = ov.Tensor(zero_point_packed, zero_point.shape, Type.u4)
+    zero_points = opset.constant(zero_point_tensor, shared_memory=True)
+    zero_points_f16 = opset.convert(zero_points, Type.f16)
+
+    scales = opset.constant(scale, dtype=np.float16)
+
+    w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
+    w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
+
+    w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
+    w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
+    return w_zp_s_f32
+
+
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
     if qtype == QType.FP16:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
     elif qtype == QType.INT8:
         final_node = make_int8_weights(key, consts, reorder, head_size)
+    elif qtype == QType.INT4:
+        final_node = make_int4_weights(key, consts, reorder, head_size)
     else:
         raise ValueError("Unsupported quantization type:")
     
@@ -464,7 +505,8 @@ def make_rms_norm(key, input, consts, epsilon):
 
 
 def make_embedding(key, input, consts, qtype):
-    embed_f32 = make_weights_subgraph(key, consts, qtype, False, -1)
+    embedding_type = QType.INT8 if qtype == QType.INT8 else QType.FP16
+    embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
     return inputs_embeds, embed_f32
@@ -656,22 +698,23 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "model.embed_tokens.weight": np.array(weights["token_embd.weight"]),
         "model.norm.weight": np.array(weights["output_norm.weight"]),
         "lm_head.weight": np.array(weights["output.weight"]) if weights.get("output.weight", None) is not None else None,
-        "lm_head.bias": None,  # GGUF models typically don"t have this bias
         "layers": []
     }
-    if config["qtype"] != QType.FP16:
+    if config["qtype"] == QType.INT8: # MLX upconverts Embeddings to FP16 in case of Q4 quantization
         consts["model.embed_tokens.scales"] = np.array(weights["token_embd.scales"])
         consts["model.embed_tokens.biases"] = np.array(weights["token_embd.biases"])
 
 
-    # w = np.array(weights["blk.29.ffn_gate.weight"])
-    # s = np.array(weights["blk.29.ffn_gate.scales"])
-    # b = np.array(weights["blk.29.ffn_gate.biases"])
+    # w = np.array(weights["blk.15.ffn_gate.weight"])
+    # s = np.array(weights["blk.15.ffn_gate.scales"])
+    # b = np.array(weights["blk.15.ffn_gate.biases"])
 
-    # print("blk.29.ffn_gate.weight:", w.shape)
-    # print("blk.29.ffn_gate.scales:", s.shape)
-    # print("blk.29.ffn_gate.biases:", b.shape)
-    # print("blk.29.ffn_gate.weight:", w.dtype)
+    # print("blk.15.ffn_gate.weight:", w.shape)
+    # print("blk.15.ffn_gate.scales:", s.shape)
+    # print("blk.15.ffn_gate.biases:", b.shape)
+    # print("blk.15.ffn_gate.weight:", w.dtype)
+    # print("blk.15.ffn_gate.scales:", s.dtype)
+    # print("blk.15.ffn_gate.biases:", b.dtype)
     
     # Extract layer weights
     print("Extract layer weights")
@@ -719,7 +762,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     cost = time.time() - beg
     print(f"extracting done, cost {cost:.2f} seconds.\nmodel configs:")
     for k, v in config.items():
-        print(f"    {k}: {v}")
+        print(f"{k}: {v}")
     return config, consts
 
 
