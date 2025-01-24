@@ -23,6 +23,8 @@ class QType(Enum):
     INT8 = 2
     INT4 = 3
 
+GGML_QUANTIZATION_GROUP_SIZE = 32
+
 
 def show_model(m):
     print("inputs of the model:")
@@ -382,14 +384,16 @@ def make_fp16_weights(key, consts, reorder, head_size):
 
 def make_int8_weights(key, consts, reorder, head_size):
     weight = consts[f"{key}.weight"]
-    scale = consts[f"{key}.scales"]
-    bias = consts[f"{key}.biases"]
+    weight = weight.view(np.uint8)
+    orig_weight_shape = list(weight.shape)
+    weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
+    scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
+    bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
     if reorder:
         weight = reorder_interleaved_format(weight, head_size)
-        scales = reorder_interleaved_format(scales, head_size)
-        biases = reorder_interleaved_format(biases, head_size)
+        scale = reorder_interleaved_format(scale, head_size)
+        bias = reorder_interleaved_format(bias, head_size)
 
-    weight = weight.view(np.uint8)
     weights = opset.constant(weight, dtype=np.uint8)
     weights.set_friendly_name(name=f"{key}.weight")
     weights_f16 = opset.convert(weights, Type.f16)
@@ -402,7 +406,9 @@ def make_int8_weights(key, consts, reorder, head_size):
 
     w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
     w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
-    w_zp_s_f32 = opset.convert(w_zp_s, Type.f32)
+
+    w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
+    w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
     return w_zp_s_f32
 
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
@@ -653,6 +659,10 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "lm_head.bias": None,  # GGUF models typically don"t have this bias
         "layers": []
     }
+    if config["qtype"] != QType.FP16:
+        consts["model.embed_tokens.scales"] = np.array(weights["token_embd.scales"])
+        consts["model.embed_tokens.biases"] = np.array(weights["token_embd.biases"])
+
 
     # w = np.array(weights["blk.29.ffn_gate.weight"])
     # s = np.array(weights["blk.29.ffn_gate.scales"])
@@ -684,6 +694,26 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
             "model.layers.mlp.down_proj.bias": None,
             "model.layers.mlp.down_proj.weight": np.array(weights[f"blk.{i}.ffn_down.weight"])
         }
+        if config["qtype"] != QType.FP16:
+            q_weights = {
+                "model.layers.self_attn.q_proj.scales": np.array(weights[f"blk.{i}.attn_q.scales"]),
+                "model.layers.self_attn.k_proj.scales": np.array(weights[f"blk.{i}.attn_k.scales"]),
+                "model.layers.self_attn.v_proj.scales": np.array(weights[f"blk.{i}.attn_v.scales"]),
+                "model.layers.self_attn.o_proj.scales": np.array(weights[f"blk.{i}.attn_output.scales"]),
+                "model.layers.mlp.gate_proj.scales": np.array(weights[f"blk.{i}.ffn_gate.scales"]),
+                "model.layers.mlp.up_proj.scales": np.array(weights[f"blk.{i}.ffn_up.scales"]),
+                "model.layers.mlp.down_proj.scales": np.array(weights[f"blk.{i}.ffn_down.scales"]),
+
+                "model.layers.self_attn.q_proj.biases": np.array(weights[f"blk.{i}.attn_q.biases"]),
+                "model.layers.self_attn.k_proj.biases": np.array(weights[f"blk.{i}.attn_k.biases"]),
+                "model.layers.self_attn.v_proj.biases": np.array(weights[f"blk.{i}.attn_v.biases"]),
+                "model.layers.self_attn.o_proj.biases": np.array(weights[f"blk.{i}.attn_output.biases"]),
+                "model.layers.mlp.gate_proj.biases": np.array(weights[f"blk.{i}.ffn_gate.biases"]),
+                "model.layers.mlp.up_proj.biases": np.array(weights[f"blk.{i}.ffn_up.biases"]),
+                "model.layers.mlp.down_proj.biases": np.array(weights[f"blk.{i}.ffn_down.biases"])
+            }
+            layer_weights = {**layer_weights, **q_weights}
+
         consts["layers"].append(layer_weights)
     
     cost = time.time() - beg
