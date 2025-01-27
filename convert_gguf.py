@@ -434,8 +434,10 @@ def make_int4_weights(key, consts, reorder, head_size):#
 
     zero_point = (-bias / scale).astype(np.uint8)
     # Pack zero points: two subsequent values into one
-    mask = np.array(0b11110000, dtype=np.uint8)
+    mask = np.array(0b00001111, dtype=np.uint8)
     zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
+    # if "model.layers.self_attn.q_proj" in key:
+    #     print("zero_point_packed: ", zero_point_packed)
     zero_point_tensor = ov.Tensor(zero_point_packed, zero_point.shape, Type.u4)
     zero_points = opset.constant(zero_point_tensor, shared_memory=True)
     zero_points_f16 = opset.convert(zero_points, Type.f16)
@@ -705,16 +707,20 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         consts["model.embed_tokens.biases"] = np.array(weights["token_embd.biases"])
 
 
-    w = np.array(weights["blk.15.ffn_gate.weight"])
-    s = np.array(weights["blk.15.ffn_gate.scales"])
-    b = np.array(weights["blk.15.ffn_gate.biases"])
+    w = np.array(weights["blk.15.attn_q.weight"])
+    s = np.array(weights["blk.15.attn_q.scales"])
+    b = np.array(weights["blk.15.attn_q.biases"])
 
-    print("blk.15.ffn_gate.weight:", w.shape)
-    print("blk.15.ffn_gate.scales:", s.shape)
-    print("blk.15.ffn_gate.biases:", b.shape)
-    print("blk.15.ffn_gate.weight:", w.dtype)
-    print("blk.15.ffn_gate.scales:", s.dtype)
-    print("blk.15.ffn_gate.biases:", b.dtype)
+    print("blk.15.attn_q.weight:", w.shape)
+    print("blk.15.attn_q.scales:", s.shape)
+    print("blk.15.attn_q.biases:", b.shape)
+    print("blk.15.attn_q.weight:", w.dtype)
+    print("blk.15.attn_q.scales:", s.dtype)
+    print("blk.15.attn_q.biases:", b.dtype)
+
+    print("blk.15.attn_q.scales: ", s)
+    print("blk.15.attn_q.biases: ", b)
+    print("ratio: ", b/s)
     
     # Extract layer weights
     print("Extract layer weights")
