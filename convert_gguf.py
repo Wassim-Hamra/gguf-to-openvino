@@ -413,32 +413,12 @@ def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weigh
     return w_zp_s_f32
 
 
-def repack_q4_weights(w):
-    # Converts from GGML Q4 format to regular compressed 4-bit format
-    # where 4 subsequent numbers are packed into one byte
-    # w is uint8 np.array
-    QK4_0 = 32
-    mask = np.array(0xF, dtype=np.uint8)
-    orig_shape = list(w.shape)
-
-    w = w.reshape(-1)
-    w1 = w & mask
-    w2 = w >> 4
-    w1 = w1.reshape(orig_shape[0], -1, QK4_0//2)
-    w2 = w2.reshape(orig_shape[0], -1, QK4_0//2)
-    new_w = np.stack([w1,w2], axis=2)
-    new_w = new_w.reshape(-1)
-    w_packed = (new_w[1::2] << 4) | (new_w[0::2] & mask)
-
-    return w_packed.reshape(orig_shape)
-
-
 def make_int4_weights(key, consts, reorder, head_size):#
     weight = consts[f"{key}.weight"]
     weight = weight.view(np.uint8)
-    weight = repack_q4_weights(weight)
     orig_weight_shape = list(weight.shape)
     orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
+
     weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
     scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
     bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
@@ -450,20 +430,18 @@ def make_int4_weights(key, consts, reorder, head_size):#
 
     shape = weight.shape
     weight_tensor = ov.Tensor(weight, (shape[0], shape[1]*2, shape[2]), Type.u4)
-    weights = opset.constant(weight_tensor, name=f"{key}.weight")#, shared_memory=True)
+    weights = opset.constant(weight_tensor, name=f"{key}.weight") # Don't use shared_memory=True
     weights_f16 = opset.convert(weights, Type.f16)
 
     zero_point = (-bias / scale).astype(np.uint8)
     zero_point_shape = list(zero_point.shape)
     zero_point = zero_point.reshape(-1)
     # Pack zero points: two subsequent values into one
-    mask = np.array(0xF, dtype=np.uint8)
+    mask = np.array(0b00001111, dtype=np.uint8)
     zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
     zero_point_packed = zero_point_packed.reshape(zero_point_shape[0], zero_point_shape[1]//2, zero_point_shape[2])
-    # if "model.layers.self_attn.q_proj" in key:
-    #     print("zero_point_packed: ", zero_point_packed)
     zero_point_tensor = ov.Tensor(zero_point_packed, tuple(zero_point_shape), Type.u4)
-    zero_points = opset.constant(zero_point_tensor)#, shared_memory=True)
+    zero_points = opset.constant(zero_point_tensor) # Don't use shared_memory=True
     zero_points_f16 = opset.convert(zero_points, Type.f16)
 
     scales = opset.constant(scale, dtype=np.float16)
@@ -731,20 +709,20 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         consts["model.embed_tokens.biases"] = np.array(weights["token_embd.biases"])
 
 
-    w = np.array(weights["blk.15.attn_q.weight"])
-    s = np.array(weights["blk.15.attn_q.scales"])
-    b = np.array(weights["blk.15.attn_q.biases"])
+    # w = np.array(weights["blk.15.attn_q.weight"])
+    # s = np.array(weights["blk.15.attn_q.scales"])
+    # b = np.array(weights["blk.15.attn_q.biases"])
 
-    print("blk.15.attn_q.weight:", w.shape)
-    print("blk.15.attn_q.scales:", s.shape)
-    print("blk.15.attn_q.biases:", b.shape)
-    print("blk.15.attn_q.weight:", w.dtype)
-    print("blk.15.attn_q.scales:", s.dtype)
-    print("blk.15.attn_q.biases:", b.dtype)
+    # print("blk.15.attn_q.weight:", w.shape)
+    # print("blk.15.attn_q.scales:", s.shape)
+    # print("blk.15.attn_q.biases:", b.shape)
+    # print("blk.15.attn_q.weight:", w.dtype)
+    # print("blk.15.attn_q.scales:", s.dtype)
+    # print("blk.15.attn_q.biases:", b.dtype)
 
-    print("blk.15.attn_q.scales: ", s)
-    print("blk.15.attn_q.biases: ", b)
-    print("ratio: ", b/s)
+    # print("blk.15.attn_q.scales: ", s)
+    # print("blk.15.attn_q.biases: ", b)
+    # print("ratio: ", b/s)
     
     # Extract layer weights
     print("Extract layer weights")
