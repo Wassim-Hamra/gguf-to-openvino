@@ -15,7 +15,6 @@ from openvino.runtime import serialize
 from openvino.runtime.op import Constant
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
-import gc
 
 OV_XML_FILE_NAME="openvino_model.xml"
 
@@ -370,7 +369,7 @@ def reorder_interleaved_format(weights, head_size):
     new_weight[0:head_size // 2] = weights[0::2]
     new_weight[(head_size//2):head_size] = weights[1::2]
     new_weight = np.moveaxis(new_weight, 0, 1)
-    return np.ascontiguousarray(new_weight.reshape(shape))
+    return new_weight.reshape(shape)
 
 
 def make_fp16_weights(key, consts, reorder, head_size):
@@ -419,60 +418,38 @@ def repack_q4_weights(w):
     # where 4 subsequent numbers are packed into one byte
     # w is uint8 np.array
     QK4_0 = 32
-    mask = np.array(0b00001111, dtype=np.uint8)
-    print("w: ", w.shape)
+    mask = np.array(0xF, dtype=np.uint8)
     orig_shape = list(w.shape)
 
     w = w.reshape(-1)
-
-    w1 = np.ascontiguousarray(np.bitwise_and(w, mask))
-    w2 = np.ascontiguousarray(np.right_shift(w, 4))
+    w1 = w & mask
+    w2 = w >> 4
     w1 = w1.reshape(orig_shape[0], -1, QK4_0//2)
     w2 = w2.reshape(orig_shape[0], -1, QK4_0//2)
-
-    print("w1: ", w1.shape)
-    #w1 = np.expand_dims(w1, axis=2)
-    #w2 = np.expand_dims(w2, axis=2)
-    print("w1: ", w1.shape)
-    new_w = np.ascontiguousarray(np.stack([w1,w2], axis=2))
-    print("new_w stacked: ", new_w.shape)
+    new_w = np.stack([w1,w2], axis=2)
     new_w = new_w.reshape(-1)
+    w_packed = (new_w[1::2] << 4) | (new_w[0::2] & mask)
 
-    print("new_w size: ", new_w.shape)
-
-    high = np.ascontiguousarray(np.left_shift(new_w[1::2], 4))
-    low = np.ascontiguousarray(np.bitwise_and(new_w[0::2], mask))
-    w_packed = np.bitwise_or(low, high)
-    w_packed = np.ascontiguousarray(w_packed.reshape(*orig_shape))
-    print("w_packed: ", w_packed.shape, w_packed.dtype)
-    print("w_packed flags", w_packed.flags)
-
-    #w_packed = w1
-    return w_packed
+    return w_packed.reshape(orig_shape)
 
 
-def make_int4_weights(key, consts, reorder, head_size, layer_id):#
+def make_int4_weights(key, consts, reorder, head_size):#
     weight = consts[f"{key}.weight"]
     weight = weight.view(np.uint8)
+    weight = repack_q4_weights(weight)
     orig_weight_shape = list(weight.shape)
     orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
-    # if ("self_attn" in key or "mlp.down_proj" in key or "mlp.gate_proj" in key):
-    #     weight_repacked = repack_q4_weights(weight)
-    # else:
-    #     weight_repacked = weight
-    weight_repacked = repack_q4_weights(weight)
-        
-    weight_repacked = weight_repacked.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
+    weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
     scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
     bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
 
     if reorder:
-        weight_repacked = reorder_interleaved_format(weight_repacked, head_size)
+        weight = reorder_interleaved_format(weight, head_size)
         scale = reorder_interleaved_format(scale, head_size)
         bias = reorder_interleaved_format(bias, head_size)
 
-    shape = weight_repacked.shape
-    weight_tensor = ov.Tensor(np.ascontiguousarray(weight_repacked), [shape[0], shape[1]*2, shape[2]], Type.u4)
+    shape = weight.shape
+    weight_tensor = ov.Tensor(weight, (shape[0], shape[1]*2, shape[2]), Type.u4)
     weights = opset.constant(weight_tensor, name=f"{key}.weight")#, shared_memory=True)
     weights_f16 = opset.convert(weights, Type.f16)
 
@@ -480,16 +457,16 @@ def make_int4_weights(key, consts, reorder, head_size, layer_id):#
     zero_point_shape = list(zero_point.shape)
     zero_point = zero_point.reshape(-1)
     # Pack zero points: two subsequent values into one
-    mask = np.array(0b00001111, dtype=np.uint8)
+    mask = np.array(0xF, dtype=np.uint8)
     zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
-    zero_point_packed = np.ascontiguousarray(zero_point_packed.reshape(zero_point_shape[0], zero_point_shape[1]//2, zero_point_shape[2]))
+    zero_point_packed = zero_point_packed.reshape(zero_point_shape[0], zero_point_shape[1]//2, zero_point_shape[2])
     # if "model.layers.self_attn.q_proj" in key:
     #     print("zero_point_packed: ", zero_point_packed)
-    zero_point_tensor = ov.Tensor(zero_point_packed, zero_point_shape, Type.u4)
-    zero_points = opset.constant(zero_point_tensor, shared_memory=True)
+    zero_point_tensor = ov.Tensor(zero_point_packed, tuple(zero_point_shape), Type.u4)
+    zero_points = opset.constant(zero_point_tensor)#, shared_memory=True)
     zero_points_f16 = opset.convert(zero_points, Type.f16)
 
-    scales = opset.constant(np.ascontiguousarray(scale), dtype=np.float16)
+    scales = opset.constant(scale, dtype=np.float16)
 
     w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
     w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
@@ -499,22 +476,22 @@ def make_int4_weights(key, consts, reorder, head_size, layer_id):#
     return w_zp_s_f32
 
 
-def make_weights_subgraph(key, consts, qtype, reorder, head_size, layer_id):
+def make_weights_subgraph(key, consts, qtype, reorder, head_size):
     if qtype == QType.FP16:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
     elif qtype == QType.INT8:
         final_node = make_int8_weights(key, consts, reorder, head_size)
     elif qtype == QType.INT4:
-        final_node = make_int4_weights(key, consts, reorder, head_size, layer_id)
+        final_node = make_int4_weights(key, consts, reorder, head_size)
     else:
         raise ValueError("Unsupported quantization type:")
     
     return final_node
 
 
-def make_fc(key, input, consts, qtype, reorder=False, head_size=-1, layer_id=0):
+def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
     # weight const f32 NxK
-    w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size, layer_id)
+    w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size)
     matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
     return matmul
 
@@ -555,7 +532,7 @@ def make_rms_norm(key, input, consts, epsilon):
 
 def make_embedding(key, input, consts, qtype):
     embedding_type = QType.INT8 if qtype == QType.INT8 else QType.FP16
-    embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1, 0)
+    embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
     return inputs_embeds, embed_f32
@@ -580,9 +557,9 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     # layerNorm operation
     input_layernorm = make_rms_norm("model.layers.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
-    q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"], layer_idx)
-    k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"], layer_idx)
-    v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], False, -1, layer_idx)
+    q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"])
+    k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"])
+    v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"])
 
     input_shape = opset.shape_of(input_layernorm)
     if output_shape is None:
@@ -608,25 +585,23 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                         beam_idx=beam_idx,
                         cos_sin_cached=cos_sin_cached)
 
-    attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx], configs["qtype"], False, -1, layer_idx)
+    attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx], configs["qtype"])
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
     post_attention_layernorm = make_rms_norm("model.layers.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
-        gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx], configs["qtype"], False, -1, layer_idx)
+        gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx], configs["qtype"])
         silu = opset.swish(gate_proj)
-        up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx], configs["qtype"], False, -1, layer_idx)
+        up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx], configs["qtype"])
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
-        down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx], configs["qtype"], False, -1, layer_idx)
+        down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx], configs["qtype"])
         return down_proj
 
     mlp_output = mlp(post_attention_layernorm)
     # residual connection.
     output = opset.add(attn_output, mlp_output, auto_broadcast="numpy", name=f"{name_prefix}.add1{name_suffix}")
-    gc.collect()
-
     return output, sinks, causal_mask, cos_sin_cached, output_shape
 
 
