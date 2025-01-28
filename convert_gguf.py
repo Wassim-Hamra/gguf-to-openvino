@@ -476,7 +476,11 @@ def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
 
 def make_lm_head(key, input, consts, embeddings_node, qtype):
     if consts.get(f"{key}.weight", None) is not None:
-        w_f32 = make_weights_subgraph(key, consts, qtype, False, -1)
+        if consts.get(f"{key}.scales", None) is not None:
+            lm_head_qtype = qtype
+        else:
+            lm_head_qtype = QType.FP16
+        w_f32 = make_weights_subgraph(key, consts, lm_head_qtype, False, -1)
     else:
         w_f32 = embeddings_node # shared weights with embeddings
     return opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
@@ -509,7 +513,10 @@ def make_rms_norm(key, input, consts, epsilon):
 
 
 def make_embedding(key, input, consts, qtype):
-    embedding_type = QType.INT8 if qtype == QType.INT8 else QType.FP16
+    if consts.get(f"{key}.scales", None) is not None:
+        embedding_type = qtype
+    else:
+        embedding_type = QType.FP16
     embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
