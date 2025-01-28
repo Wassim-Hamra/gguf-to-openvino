@@ -704,9 +704,13 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "lm_head.weight": np.array(weights["output.weight"]) if weights.get("output.weight", None) is not None else None,
         "layers": []
     }
-    if config["qtype"] == QType.INT8: # MLX upconverts Embeddings to FP16 in case of Q4 quantization
+    if weights.get("token_embd.scales", None) is not None:
         consts["model.embed_tokens.scales"] = np.array(weights["token_embd.scales"])
         consts["model.embed_tokens.biases"] = np.array(weights["token_embd.biases"])
+
+    if weights.get("output.scales", None) is not None:
+        consts["lm_head.scales"] = np.array(weights["output.scales"])
+        consts["lm_head.biases"] = np.array(weights["output.biases"])
 
 
     # w = np.array(weights["blk.15.attn_q.weight"])
