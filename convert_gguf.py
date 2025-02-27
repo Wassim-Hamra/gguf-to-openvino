@@ -419,7 +419,7 @@ def make_int4_weights(key, consts, reorder, head_size):#
     orig_weight_shape = list(weight.shape)
     orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
 
-    weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
+    weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE//2)
     scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
     bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
 
@@ -428,9 +428,9 @@ def make_int4_weights(key, consts, reorder, head_size):#
         scale = reorder_interleaved_format(scale, head_size)
         bias = reorder_interleaved_format(bias, head_size)
 
-    shape = weight.shape
-    weight_tensor = ov.Tensor(weight, (shape[0], shape[1]*2, shape[2]), Type.u4)
-    weights = opset.constant(weight_tensor, name=f"{key}.weight") # Don't use shared_memory=True
+    shape = (orig_weight_shape[0], orig_weight_shape[1]//GGML_QUANTIZATION_GROUP_SIZE, GGML_QUANTIZATION_GROUP_SIZE)
+    weight_tensor = ov.Tensor(weight.reshape(-1), shape, Type.u4)
+    weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=False) # Don't use shared_memory=True
     weights_f16 = opset.convert(weights, Type.f16)
 
     zero_point = (-bias / scale).astype(np.uint8)
@@ -439,9 +439,8 @@ def make_int4_weights(key, consts, reorder, head_size):#
     # Pack zero points: two subsequent values into one
     mask = np.array(0b00001111, dtype=np.uint8)
     zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
-    zero_point_packed = zero_point_packed.reshape(zero_point_shape[0], zero_point_shape[1]//2, zero_point_shape[2])
     zero_point_tensor = ov.Tensor(zero_point_packed, tuple(zero_point_shape), Type.u4)
-    zero_points = opset.constant(zero_point_tensor) # Don't use shared_memory=True
+    zero_points = opset.constant(zero_point_tensor, shared_memory=False) # Don't use shared_memory=True
     zero_points_f16 = opset.convert(zero_points, Type.f16)
 
     scales = opset.constant(scale, dtype=np.float16)
