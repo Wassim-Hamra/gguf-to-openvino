@@ -2,3 +2,4 @@ transformers
 openvino
 openvino-tokenizers
 mlx
+huggingface_hub
